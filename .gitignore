@@ -1,0 +1,55 @@
+# Build outputs
+/build/
+/build-*/
+/cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+CTestTestfile.cmake
+Testing/
+Makefile
+cmake_install.cmake
+compile_commands.json
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Runtime/session artifacts
+*.session
+*.session.tmp
+*.log
+*.pcap
+*.bin
+*.dump
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editor and local agent/tooling state
+.agents/
+.codex/
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+.agents/
+.codex/
+.claude/
+.vscode/
