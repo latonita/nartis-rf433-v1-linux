@@ -11,7 +11,14 @@ static void usage(FILE *f) {
     "  nartisctl pair    --meter-serial S --session PATH --sdio N --sclk N --csb N --fcsb N --gpio3 N\n"
     "  nartisctl read    --meter-serial S --session PATH --obis A.B.C.D.E.F[,class=N,attr=N] ... pins...\n"
     "\n"
-    "Options: --ciu-serial S --ciu-address HEX16 --fixed-channel N --alternative-channels\n");
+    "Options: --ciu-serial S --ciu-address HEX16 --fixed-channel N --alternative-channels --batch-size N\n"
+    "\n"
+    "Radio (default CMT2300A, bit-banged SPI via --sdio/--sclk/--csb/--fcsb/--gpio3):\n"
+    "  --radio cc1101            use a CC1101 on a kernel SPI device instead\n"
+    "  --spi-dev PATH            CC1101 SPI device (default /dev/spidev0.0)\n"
+    "  --gdo0 N                  CC1101 GDO0 GPIO (optional; polled over SPI if omitted)\n"
+    "  --freq-offset HZ          CC1101 signed crystal correction, applied to TX and RX\n"
+    "  --tx-preamble N           CC1101 0x55 preamble bytes before sync (default 12)\n");
 }
 
 static int parse_u(const char *s) { return s ? (int)strtol(s, NULL, 0) : -1; }
@@ -49,6 +56,8 @@ int main(int argc, char **argv) {
   cfg.batch_size = 5;
   cfg.rx_timeout_ms = 3000;
   cfg.rx_reply_timeout_ms = 900;
+  cfg.radio_type = NARTIS_RADIO_CMT2300A;
+  cfg.cc1101.gdo0 = -1;
   nartis_attr_t attrs[32];
   size_t attr_count = 0;
 
@@ -66,6 +75,16 @@ int main(int argc, char **argv) {
     else if (strcmp(a, "--fixed-channel") == 0) cfg.fixed_channel = parse_u(argval(&i, argc, argv));
     else if (strcmp(a, "--alternative-channels") == 0) cfg.use_alternative_channels = true;
     else if (strcmp(a, "--batch-size") == 0) cfg.batch_size = (uint8_t)parse_u(argval(&i, argc, argv));
+    else if (strcmp(a, "--radio") == 0) {
+      const char *v = argval(&i, argc, argv);
+      if (v && strcmp(v, "cc1101") == 0) cfg.radio_type = NARTIS_RADIO_CC1101;
+      else if (v && strcmp(v, "cmt2300a") == 0) cfg.radio_type = NARTIS_RADIO_CMT2300A;
+      else { fprintf(stderr, "--radio must be cmt2300a or cc1101\n"); return 2; }
+    }
+    else if (strcmp(a, "--spi-dev") == 0) cfg.cc1101.spi_dev = argval(&i, argc, argv);
+    else if (strcmp(a, "--gdo0") == 0) cfg.cc1101.gdo0 = parse_u(argval(&i, argc, argv));
+    else if (strcmp(a, "--freq-offset") == 0) cfg.cc1101.freq_offset_hz = parse_u(argval(&i, argc, argv));
+    else if (strcmp(a, "--tx-preamble") == 0) cfg.cc1101.tx_preamble_bytes = parse_u(argval(&i, argc, argv));
     else if (strcmp(a, "--obis") == 0) {
       const char *v = argval(&i, argc, argv);
       if (!v || attr_count >= 32 || parse_attr(v, &attrs[attr_count]) != NARTIS_OK) {
@@ -80,7 +99,8 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!cfg.pins.sdio && !cfg.pins.sclk && !cfg.pins.csb && !cfg.pins.fcsb && !cfg.pins.gpio3) {
+  if (cfg.radio_type == NARTIS_RADIO_CMT2300A &&
+      !cfg.pins.sdio && !cfg.pins.sclk && !cfg.pins.csb && !cfg.pins.fcsb && !cfg.pins.gpio3) {
     fprintf(stderr, "GPIO pins are required\n");
     return 2;
   }
@@ -98,11 +118,20 @@ int main(int argc, char **argv) {
   const nartis_backend_t *backend = nartis_sysfs_backend_iface(sysfs);
 
   if (strcmp(cmd, "chip-id") == 0) {
-    nartis_cmt2300a_t *radio = NULL;
-    rc = nartis_cmt2300a_open(&radio, backend, &cfg.pins);
-    if (rc == NARTIS_OK) rc = nartis_cmt2300a_init(radio);
-    if (rc == NARTIS_OK) printf("CMT2300A product-id=0x%02x\n", nartis_cmt2300a_read_reg(radio, 0x01));
-    nartis_cmt2300a_close(radio);
+    if (cfg.radio_type == NARTIS_RADIO_CC1101) {
+      nartis_cc1101_t *radio = NULL;
+      rc = nartis_cc1101_open(&radio, backend, &cfg.cc1101);
+      if (rc == NARTIS_OK) rc = nartis_cc1101_init(radio);
+      if (rc == NARTIS_OK) printf("CC1101 connected (spi=%s)\n", cfg.cc1101.spi_dev ? cfg.cc1101.spi_dev : "/dev/spidev0.0");
+      else fprintf(stderr, "CC1101 not detected (check wiring/spi-dev)\n");
+      nartis_cc1101_close(radio);
+    } else {
+      nartis_cmt2300a_t *radio = NULL;
+      rc = nartis_cmt2300a_open(&radio, backend, &cfg.pins);
+      if (rc == NARTIS_OK) rc = nartis_cmt2300a_init(radio);
+      if (rc == NARTIS_OK) printf("CMT2300A product-id=0x%02x\n", nartis_cmt2300a_read_reg(radio, 0x01));
+      nartis_cmt2300a_close(radio);
+    }
   } else {
     nartis_meter_t *m = NULL;
     rc = nartis_open(&m, &cfg, backend);

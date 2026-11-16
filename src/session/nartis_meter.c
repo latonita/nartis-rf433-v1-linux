@@ -8,12 +8,26 @@
 enum {
   FRAME_COUNTER_MARGIN = 16,
   MAX_RETRIES = 3,
+  MAX_LEARNED_TYPES = 32,
+  MAX_BATCH_TYPE_RETRIES = 2,
 };
+
+/* Per-OBIS learned DLMS type/length, used to reject a value whose type/len does
+ * not match what this code returned before - a stale or misattributed reply. A
+ * new type seen twice in a row is treated as a real change and accepted. */
+typedef struct {
+  nartis_obis_t obis;
+  uint8_t learned_dtype;  /* 0xFF = not learned yet */
+  uint8_t learned_len;
+  uint8_t pending_dtype;  /* 0xFF = none */
+  uint8_t pending_len;
+  bool used;
+} learned_type_t;
 
 struct nartis_meter {
   nartis_config_t cfg;
   nartis_backend_t backend;
-  nartis_cmt2300a_t *radio;
+  nartis_radio_t radio;
   nartis_rf_ctx_t rf;
   nartis_session_state_t session;
   uint8_t data_seq;
@@ -27,7 +41,57 @@ struct nartis_meter {
   char ciu_serial[32];
   char ciu_address_hex[24];
   char session_path[256];
+  learned_type_t learned[MAX_LEARNED_TYPES];
 };
+
+static bool dlms_type_is_var_len(uint8_t dtype) {
+  return dtype == 0x09 || dtype == 0x0A || dtype == 0x0C ||
+         dtype == 0x19 || dtype == 0x01 || dtype == 0x02;
+}
+
+static learned_type_t *learned_for(nartis_meter_t *m, const nartis_obis_t *obis) {
+  int free_slot = -1;
+  for (int i = 0; i < MAX_LEARNED_TYPES; ++i) {
+    if (m->learned[i].used) {
+      if (memcmp(m->learned[i].obis.bytes, obis->bytes, 6) == 0) return &m->learned[i];
+    } else if (free_slot < 0) {
+      free_slot = i;
+    }
+  }
+  if (free_slot < 0) return NULL;
+  learned_type_t *e = &m->learned[free_slot];
+  e->used = true;
+  e->obis = *obis;
+  e->learned_dtype = 0xFF;
+  e->pending_dtype = 0xFF;
+  return e;
+}
+
+/* Returns true if the value may be stored, false if it should be rejected and
+ * the batch re-sent (type/len differs from what this OBIS returned before). */
+static bool learned_type_accept(learned_type_t *e, const nartis_value_t *v) {
+  if (!e || !v->valid || e->learned_dtype == 0xFF) return true;
+  bool var = dlms_type_is_var_len(e->learned_dtype);
+  if (v->dtype == e->learned_dtype && (var || v->raw_len == e->learned_len)) {
+    e->pending_dtype = 0xFF;
+    return true;
+  }
+  if (e->pending_dtype == v->dtype && e->pending_len == v->raw_len) {
+    e->learned_dtype = 0xFF;  /* a new type seen twice = real change */
+    e->pending_dtype = 0xFF;
+    return true;
+  }
+  e->pending_dtype = v->dtype;
+  e->pending_len = v->raw_len;
+  return false;
+}
+
+static void learned_type_store(learned_type_t *e, const nartis_value_t *v) {
+  if (e && v->valid && e->learned_dtype == 0xFF) {
+    e->learned_dtype = v->dtype;
+    e->learned_len = v->raw_len;
+  }
+}
 
 static void sleep_ms(nartis_meter_t *m, uint32_t ms) {
   m->backend.delay_us(m->backend.ctx, ms * 1000u);
@@ -136,27 +200,32 @@ int nartis_open(nartis_meter_t **out, const nartis_config_t *cfg,
   m->data_seq = 2;
   m->beacon_seq = 1;
   m->active_channel = 2;
-  int rc = nartis_cmt2300a_open(&m->radio, backend, &cfg->pins);
+  int rc;
+  if (m->cfg.radio_type == NARTIS_RADIO_CC1101) {
+    rc = nartis_radio_open_cc1101(&m->radio, backend, &cfg->cc1101);
+  } else {
+    rc = nartis_radio_open_cmt2300a(&m->radio, backend, &cfg->pins);
+  }
   if (rc != NARTIS_OK) {
     free(m);
     return rc;
   }
-  nartis_cmt2300a_use_custom_channels(m->radio, cfg->use_alternative_channels);
+  m->radio.ops->use_custom_channels(m->radio.dev, cfg->use_alternative_channels);
   *out = m;
   return NARTIS_OK;
 }
 
 void nartis_close(nartis_meter_t *m) {
   if (!m) return;
-  nartis_cmt2300a_close(m->radio);
+  if (m->radio.ops) m->radio.ops->close(m->radio.dev);
   free(m);
 }
 
 int nartis_init(nartis_meter_t *m) {
   if (!m) return NARTIS_ERR_ARG;
-  int rc = nartis_cmt2300a_init(m->radio);
+  int rc = m->radio.ops->init(m->radio.dev);
   if (rc != NARTIS_OK) return rc;
-  nartis_cmt2300a_test_gpio3(m->radio);
+  m->radio.ops->test_gpio(m->radio.dev);
   m->initialized = true;
   if (m->session_path[0]) nartis_load_session(m);
   return NARTIS_OK;
@@ -164,7 +233,7 @@ int nartis_init(nartis_meter_t *m) {
 
 int nartis_scan_channels(nartis_meter_t *m, int8_t scores[4], uint8_t *best_ch) {
   if (!m) return NARTIS_ERR_ARG;
-  return nartis_cmt2300a_scan_channels(m->radio, scores, best_ch);
+  return m->radio.ops->scan_channels(m->radio.dev, scores, best_ch);
 }
 
 static size_t build_pair_probe(nartis_meter_t *m, uint8_t *out, size_t max) {
@@ -213,14 +282,14 @@ static int tx_frame(nartis_meter_t *m, nartis_rf_frame_type_t type,
   uint8_t frame[NARTIS_MAX_RF_FRAME_SIZE];
   size_t len = nartis_rf_build_frame(&m->rf, frame, sizeof(frame), type, seq, payload, payload_len);
   if (!len) return NARTIS_ERR_PROTOCOL;
-  return nartis_cmt2300a_transmit(m->radio, frame, len);
+  return m->radio.ops->transmit(m->radio.dev, frame, len);
 }
 
 static int rx_frame_raw(nartis_meter_t *m, uint8_t *frame, size_t *frame_len, uint32_t timeout_ms) {
-  int rc = nartis_cmt2300a_start_rx(m->radio);
+  int rc = m->radio.ops->start_rx(m->radio.dev);
   if (rc != NARTIS_OK) return rc;
-  rc = nartis_cmt2300a_poll_rx(m->radio, frame, frame_len, NARTIS_MAX_RF_FRAME_SIZE, timeout_ms);
-  nartis_cmt2300a_finish_rx(m->radio);
+  rc = m->radio.ops->poll_rx(m->radio.dev, frame, frame_len, NARTIS_MAX_RF_FRAME_SIZE, timeout_ms);
+  m->radio.ops->finish_rx(m->radio.dev);
   return rc;
 }
 
@@ -241,12 +310,12 @@ static int select_channel(nartis_meter_t *m) {
     m->active_channel = (uint8_t)(m->cfg.fixed_channel & 3);
   } else if (!m->cfg.use_alternative_channels) {
     uint8_t best = 1;
-    nartis_cmt2300a_scan_channels(m->radio, m->rssi, &best);
+    m->radio.ops->scan_channels(m->radio.dev, m->rssi, &best);
     m->active_channel = best;
   } else {
     m->active_channel = 2;
   }
-  nartis_cmt2300a_set_channel(m->radio, m->active_channel);
+  m->radio.ops->set_channel(m->radio.dev, m->active_channel);
   nartis_rf_set_channel_quality(&m->rf, m->active_channel, m->rssi[m->active_channel]);
   return NARTIS_OK;
 }
@@ -326,30 +395,60 @@ static int tx_dlms(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len) {
   return tx_frame(m, RF_FRAME_ACK, m->data_seq++, plain, apdu_len + 8);
 }
 
-static int receive_data_response(nartis_meter_t *m, nartis_value_t *values, uint8_t expected,
-                                 const uint16_t *class_ids, uint8_t *got) {
-  uint8_t payload[256], dlms[256], type = 0;
-  int plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
-  if (plen < 0) return plen;
-  if (type == RX_TYPE_REQUEST_ACK) {
-    uint8_t beacon[32];
-    size_t beacon_len = build_beacon(beacon, sizeof(beacon));
-    int rc = tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, beacon_len);
+/* Pacing to match the meter's get-request handshake (values from the ESPHome
+ * component): after the meter acks a request it needs a gate before the data is
+ * ready, polled for with beacons; a request that draws no reply is re-sent. */
+enum {
+  GET_REPLY_MAX_RETRIES = 6,
+  READ_POLL_BEACON_DELAY_MS = 5000,
+  PRIMING_POLL_BEACON_DELAY_MS = 1000,
+  READ_MAX_POLL = 3,
+  PRIMING_MAX_POLL = 2,
+};
+
+static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
+                        nartis_value_t *values, uint8_t expected,
+                        const uint16_t *class_ids, uint8_t *got, bool priming) {
+  const uint32_t poll_delay = priming ? PRIMING_POLL_BEACON_DELAY_MS : READ_POLL_BEACON_DELAY_MS;
+  const int max_poll = priming ? PRIMING_MAX_POLL : READ_MAX_POLL;
+  uint8_t payload[256], dlms[256], type;
+  int plen = -1;
+  bool have_data = false;
+
+  for (int req_try = 0; req_try < GET_REPLY_MAX_RETRIES && !have_data; ++req_try) {
+    int rc = tx_dlms(m, apdu, apdu_len);
     if (rc != NARTIS_OK) return rc;
+    type = 0;
     plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
-    if (plen < 0) return plen;
+    if (plen >= 0 && type == RX_TYPE_DATA) { have_data = true; break; }
+    if (plen >= 0 && (type == RX_TYPE_REQUEST_ACK || type == RX_TYPE_SHORT_ACK)) {
+      /* request accepted; poll for the data with beacons after a settle gate */
+      for (int p = 0; p < max_poll && !have_data; ++p) {
+        sleep_ms(m, poll_delay);
+        uint8_t beacon[32];
+        size_t bl = build_beacon(beacon, sizeof(beacon));
+        rc = tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, bl);
+        if (rc != NARTIS_OK) return rc;
+        type = 0;
+        plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
+        if (plen >= 0 && type == RX_TYPE_DATA) have_data = true;
+      }
+    }
+    /* otherwise: no usable reply - re-send the get-request */
   }
-  if (type != RX_TYPE_DATA) return NARTIS_ERR_PROTOCOL;
+  if (!have_data) return NARTIS_ERR_TIMEOUT;
+
   int dlen = nartis_rf_parse_nested(&m->rf, payload, (size_t)plen, dlms, sizeof(dlms), true);
   if (dlen < 0) return dlen;
-  if (!nartis_dlms_parse_read_response_list(dlms, (size_t)dlen, values, expected, got, class_ids)) return NARTIS_ERR_PROTOCOL;
+  if (!nartis_dlms_parse_read_response_list(dlms, (size_t)dlen, values, expected, got, class_ids))
+    return NARTIS_ERR_PROTOCOL;
+
+  /* closing beacon; the short ack that follows is not needed */
   uint8_t beacon[32];
-  size_t beacon_len = build_beacon(beacon, sizeof(beacon));
-  int rc = tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, beacon_len);
-  if (rc == NARTIS_OK) {
-    uint8_t ack_type = 0;
-    int ack_len = rx_parse(m, payload, sizeof(payload), &ack_type, m->cfg.rx_reply_timeout_ms);
-    (void)ack_len;
+  size_t bl = build_beacon(beacon, sizeof(beacon));
+  if (tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, bl) == NARTIS_OK) {
+    uint8_t at = 0;
+    (void) rx_parse(m, payload, sizeof(payload), &at, m->cfg.rx_reply_timeout_ms);
   }
   return NARTIS_OK;
 }
@@ -374,17 +473,18 @@ int nartis_read(nartis_meter_t *m, const nartis_attr_t *attrs, size_t attr_count
   if (rc != NARTIS_OK) return rc;
   uint8_t payload[256], type = 0;
   int plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
-  if (plen < 0 || type != RX_TYPE_SHORT_ACK) return plen < 0 ? plen : NARTIS_ERR_PROTOCOL;
+  /* The meter answers a wake beacon with a short ack (0x40) or, when it is
+   * already mid-session, a request ack (0x5B). Both mean it heard us. */
+  if (plen < 0) return plen;
+  if (type != RX_TYPE_SHORT_ACK && type != RX_TYPE_REQUEST_ACK) return NARTIS_ERR_PROTOCOL;
 
   if (!m->session_primed) {
     static const nartis_obis_t vendor = {{0x00,0x00,0x60,0x80,0x03,0xFF}};
     uint8_t apdu[32];
     size_t apdu_len = nartis_dlms_build_get_request_normal(apdu, sizeof(apdu), &vendor, 1, 2);
-    rc = tx_dlms(m, apdu, apdu_len);
-    if (rc != NARTIS_OK) return rc;
     nartis_value_t dummy[NARTIS_MAX_LIST_ATTRS];
     uint8_t got = 0;
-    rc = receive_data_response(m, dummy, NARTIS_MAX_LIST_ATTRS, NULL, &got);
+    rc = do_get_cycle(m, apdu, apdu_len, dummy, NARTIS_MAX_LIST_ATTRS, NULL, &got, true);
     if (rc != NARTIS_OK) return rc;
     m->session_primed = true;
     if (m->session_path[0]) nartis_save_session(m);
@@ -397,18 +497,39 @@ int nartis_read(nartis_meter_t *m, const nartis_attr_t *attrs, size_t attr_count
     uint8_t apdu[4 + 10 * NARTIS_MAX_LIST_ATTRS];
     size_t apdu_len = nartis_dlms_build_get_request_with_list(apdu, sizeof(apdu), attrs + idx, batch);
     if (!apdu_len) return NARTIS_ERR_ARG;
-    rc = tx_dlms(m, apdu, apdu_len);
-    if (rc != NARTIS_OK) return rc;
     uint16_t class_ids[NARTIS_MAX_LIST_ATTRS] = {0};
     for (uint8_t i = 0; i < batch; ++i) class_ids[i] = attrs[idx + i].class_id;
-    uint8_t got = 0;
-    rc = receive_data_response(m, values + idx, batch, class_ids, &got);
-    if (rc != NARTIS_OK) return rc;
-    if (got != batch) return NARTIS_ERR_PROTOCOL;
+
+    int type_retries = 0;
+    for (;;) {
+      uint8_t got = 0;
+      rc = do_get_cycle(m, apdu, apdu_len, values + idx, batch, class_ids, &got, false);
+      if (rc != NARTIS_OK) return rc;
+      if (got != batch) return NARTIS_ERR_PROTOCOL;
+
+      /* PR7 backstop: reject a batch whose value types/lengths differ from what
+       * these OBIS codes returned before (a stale/misattributed reply) and
+       * re-send; a new type seen twice is accepted as a genuine change. */
+      bool all_ok = true;
+      for (uint8_t i = 0; i < batch; ++i) {
+        learned_type_t *e = learned_for(m, &attrs[idx + i].obis);
+        if (!learned_type_accept(e, &values[idx + i])) {
+          all_ok = false;
+          nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
+                             "value type/len mismatch for attr %zu - re-sending batch",
+                             idx + (size_t) i);
+        }
+      }
+      if (all_ok || ++type_retries > MAX_BATCH_TYPE_RETRIES) {
+        for (uint8_t i = 0; i < batch; ++i)
+          learned_type_store(learned_for(m, &attrs[idx + i].obis), &values[idx + i]);
+        break;
+      }
+    }
     idx += batch;
   }
   if (m->session_path[0]) nartis_save_session(m);
-  nartis_cmt2300a_go_sleep(m->radio);
+  m->radio.ops->go_sleep(m->radio.dev);
   return NARTIS_OK;
 }
 
