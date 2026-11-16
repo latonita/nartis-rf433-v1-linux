@@ -165,10 +165,16 @@ void nartis_cc1101_close(nartis_cc1101_t *d) {
 
 int nartis_cc1101_init(nartis_cc1101_t *d) {
   if (!d) return NARTIS_ERR_ARG;
-  strobe(d, CS_SRES);
-  delay_us(d, 3000);
-  strobe(d, CS_SIDLE);
-  wait_idle(d, 50);
+  /* Wake from any prior low-power state and reset; retry so a chip left asleep
+   * by a previous run reliably comes back. */
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    strobe(d, CS_SIDLE);  /* wake from SLEEP/XOFF */
+    delay_us(d, 1000);
+    strobe(d, CS_SRES);
+    delay_us(d, 3000);
+    strobe(d, CS_SIDLE);
+    if (wait_idle(d, 50) == NARTIS_OK) break;
+  }
 
   wr(d, R_IOCFG2, 0x2E);
   wr(d, R_IOCFG1, 0x2E);
@@ -386,8 +392,9 @@ int nartis_cc1101_finish_rx(nartis_cc1101_t *d) {
 
 int nartis_cc1101_go_sleep(nartis_cc1101_t *d) {
   if (!d) return NARTIS_ERR_ARG;
+  /* Stay in IDLE rather than full power-down (SPWD): the kernel spidev path
+   * cannot do the CSn/CHIP_RDYn wake handshake, so a powered-down chip is not
+   * reliably reachable on the next run. IDLE keeps it responsive. */
   strobe(d, CS_SIDLE);
-  wait_idle(d, 20);
-  strobe(d, CS_SPWD);
-  return NARTIS_OK;
+  return wait_idle(d, 20);
 }
