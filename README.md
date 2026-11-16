@@ -113,4 +113,6 @@ Typical flow:
 
 ## Notes
 
+Leave a gap between reads. The meter will not open a fresh session immediately after the previous one; polling it again within a few tens of seconds tends to fail. Space `read` invocations by about 120 s (this is the caller's responsibility; the library does not enforce it). Within a single read the library now retries the wake, re-sends the get-request, and handles a mid-session re-key.
+
 The sysfs GPIO backend is dependency-light but timing-jittery. The backend interface is deliberately small so a faster Raspberry Pi backend can be added later using `libgpiod`, `pigpio`, or a kernel helper without touching the protocol layers.

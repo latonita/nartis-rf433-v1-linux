@@ -395,6 +395,19 @@ static int tx_dlms(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len) {
   return tx_frame(m, RF_FRAME_ACK, m->data_seq++, plain, apdu_len + 8);
 }
 
+/* A SESSION_SETUP (0x53) seen mid-session means the meter re-keyed. Install the
+ * new data key and persist it so the rest of the cycle uses it. Best effort: if
+ * the frame yields no key, the current key is left in place. */
+static bool handle_rekey_(nartis_meter_t *m, const uint8_t *payload, int plen, uint8_t type) {
+  if (type != RX_TYPE_SESSION_SETUP || plen < 0) return false;
+  uint8_t key[16];
+  if (nartis_rf_extract_session_key(&m->rf, payload, (size_t) plen, key)) {
+    nartis_rf_set_aes_key(&m->rf, key);
+    if (m->session_path[0]) nartis_save_session(m);
+  }
+  return true;
+}
+
 /* Pacing to match the meter's get-request handshake (values from the ESPHome
  * component): after the meter acks a request it needs a gate before the data is
  * ready, polled for with beacons; a request that draws no reply is re-sent. */
@@ -420,6 +433,7 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
     if (rc != NARTIS_OK) return rc;
     type = 0;
     plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
+    if (plen >= 0 && type == RX_TYPE_SESSION_SETUP) { handle_rekey_(m, payload, plen, type); continue; }
     if (plen >= 0 && type == RX_TYPE_DATA) { have_data = true; break; }
     if (plen >= 0 && (type == RX_TYPE_REQUEST_ACK || type == RX_TYPE_SHORT_ACK)) {
       /* request accepted; poll for the data with beacons after a settle gate */
@@ -431,10 +445,11 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
         if (rc != NARTIS_OK) return rc;
         type = 0;
         plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
+        if (plen >= 0 && type == RX_TYPE_SESSION_SETUP) { handle_rekey_(m, payload, plen, type); break; }
         if (plen >= 0 && type == RX_TYPE_DATA) have_data = true;
       }
     }
-    /* otherwise: no usable reply - re-send the get-request */
+    /* otherwise (no reply, 0x40 not-ready, or a re-key): re-send the get-request */
   }
   if (!have_data) return NARTIS_ERR_TIMEOUT;
 
@@ -467,16 +482,29 @@ int nartis_read(nartis_meter_t *m, const nartis_attr_t *attrs, size_t attr_count
   select_channel(m);
   memset(values, 0, sizeof(values[0]) * value_capacity);
 
-  uint8_t beacon[32];
-  size_t beacon_len = build_beacon(beacon, sizeof(beacon));
-  int rc = tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, beacon_len);
-  if (rc != NARTIS_OK) return rc;
+  /* Wake the meter, retrying a few times: a single frame lost to RF noise should
+   * not fail the whole read. The meter answers with a short ack (0x40) or, when
+   * already mid-session, a request ack (0x5B); a 0x53 means it re-keyed, which we
+   * install and then proceed. Anything else (noise/timeout) is retried. */
   uint8_t payload[256], type = 0;
-  int plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
-  /* The meter answers a wake beacon with a short ack (0x40) or, when it is
-   * already mid-session, a request ack (0x5B). Both mean it heard us. */
-  if (plen < 0) return plen;
-  if (type != RX_TYPE_SHORT_ACK && type != RX_TYPE_REQUEST_ACK) return NARTIS_ERR_PROTOCOL;
+  int plen = -1;
+  int rc = NARTIS_OK;
+  bool woke = false;
+  for (int wake_try = 0; wake_try < 3 && !woke; ++wake_try) {
+    uint8_t beacon[32];
+    size_t beacon_len = build_beacon(beacon, sizeof(beacon));
+    rc = tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, beacon_len);
+    if (rc != NARTIS_OK) return rc;
+    type = 0;
+    plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
+    if (plen >= 0 && (type == RX_TYPE_SHORT_ACK || type == RX_TYPE_REQUEST_ACK)) {
+      woke = true;
+    } else if (plen >= 0 && type == RX_TYPE_SESSION_SETUP) {
+      handle_rekey_(m, payload, plen, type);
+      woke = true;
+    }
+  }
+  if (!woke) return NARTIS_ERR_TIMEOUT;
 
   if (!m->session_primed) {
     static const nartis_obis_t vendor = {{0x00,0x00,0x60,0x80,0x03,0xFF}};

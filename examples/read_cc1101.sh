@@ -25,6 +25,8 @@ set -e
   --alternative-channels
 
 # 3) Read one or more OBIS attributes. Output is JSON on stdout.
+#    Leave ~120 s between reads: the meter will not open a new session right
+#    after the previous one, so polling too soon fails.
 #    class/attr default to 3/2 (Register/value) and can be overridden per OBIS.
 "$CTL" read \
   --radio cc1101 --spi-dev "$SPI" \
