@@ -455,8 +455,13 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
 
   int dlen = nartis_rf_parse_nested(&m->rf, payload, (size_t)plen, dlms, sizeof(dlms), true);
   if (dlen < 0) return dlen;
-  if (!nartis_dlms_parse_read_response_list(dlms, (size_t)dlen, values, expected, got, class_ids))
-    return NARTIS_ERR_PROTOCOL;
+  /* The priming request is a get-request-normal whose response is a throwaway
+   * used only to engage the session - it is not a with-list response, so do not
+   * parse it as one. Real batches use get-request-with-list. */
+  if (!priming) {
+    if (!nartis_dlms_parse_read_response_list(dlms, (size_t)dlen, values, expected, got, class_ids))
+      return NARTIS_ERR_PROTOCOL;
+  }
 
   /* closing beacon; the short ack that follows is not needed */
   uint8_t beacon[32];
