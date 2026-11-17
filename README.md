@@ -70,7 +70,11 @@ Pass `--radio cc1101` and a SPI device instead of the CMT2300A GPIO pins. The CC
   --obis 1.0.32.7.0.255 --obis 1.0.1.7.0.255
 ```
 
-CC1101 options: `--spi-dev PATH` (default `/dev/spidev0.0`), `--gdo0 N` (optional GDO0 GPIO; polled over SPI if omitted), `--freq-offset HZ` (signed crystal correction applied to TX and RX), `--tx-preamble N` (default 12). Each CC1101 module's crystal is a few kHz off; if the meter never replies, read the FREQEST a sniffer reports on a received frame and pass it as `--freq-offset`.
+CC1101 options: `--spi-dev PATH` (default `/dev/spidev0.0`), `--gdo0 N` (optional GDO0 GPIO; polled over SPI if omitted), `--freq-offset HZ` (signed crystal correction applied to TX and RX), `--tx-preamble N` (default 12). Each CC1101 module's crystal is a few kHz off; if the meter never replies, read the FREQEST a sniffer reports on a received frame and pass it as `--freq-offset`. An offset that is a little off still lets short frames through but loses long ones, so pairing fails (the session-setup frame is long) while reads may still work. The Raspberry Pi 5 test module needed `--freq-offset 14282`; the debug log prints FREQEST for every received frame, which should be near 0 once the offset is right.
+
+`--invoke-enforce` rejects a GET reply whose DLMS invoke-id, result count or length does not match the request and re-sends the same request. Without it the invoke-id is only logged (`GET invoke: sent=N recv=M match=yes|NO`). The tested meter echoes the invoke-id.
+
+See [docs/protocol-flow.md](docs/protocol-flow.md) for the pairing and read flows, timings and bench results.
 
 ### Session transplant
 
