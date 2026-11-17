@@ -609,6 +609,75 @@ enum {
 
 enum { GET_REJECT_RESEND_DELAY_MS = 1000 };
 
+/* Closing and wake pacing (ESPHome READ_CLOSE_BEACON_DELAY_MS_ and denis-isaev's
+ * wake retry). The meter waits ~4.2 s after sending a data reply before it
+ * accepts the closing beacon; a beacon sent sooner leaves its session open, and
+ * the next wake is then answered with a re-delivered copy of that data frame. */
+enum {
+  READ_CLOSE_BEACON_DELAY_MS = 4500,
+  CLOSE_MAX_FRAMES = 4,
+  WAKE_MAX_BEACONS = 4,               /* first beacon + 3 retries, as ESPHome */
+  WAKE_STALE_DATA_DELAY_MS = 4500,    /* pause after a re-delivered 0x43 at wake */
+};
+
+/* True if a 0x43 seen after the closing beacon is an authenticated repeat of the
+ * reply just accepted for this GET (same invoke-id and result count). Decrypts
+ * with mutate_counter=false into scratch buffers: never stores values and never
+ * moves the replay counter. */
+static bool is_repeat_of_accepted_(nartis_meter_t *m, const uint8_t *payload, int plen,
+                                   uint8_t expected, bool priming, int expected_invoke_id) {
+  uint8_t dlms[256];
+  int dlen = nartis_rf_parse_nested(&m->rf, payload, (size_t)plen, dlms, sizeof(dlms), false);
+  if (dlen <= 0) return false;
+  if (priming) return true;  /* priming answer is a normal-response, discarded anyway */
+  nartis_value_t scratch[NARTIS_MAX_LIST_ATTRS];
+  uint8_t got = 0;
+  if (!nartis_dlms_parse_read_response_list(dlms, (size_t)dlen, scratch, expected, &got, NULL,
+                                            expected_invoke_id, true, NULL))
+    return false;
+  return got == expected;
+}
+
+/* Close one GET after its data was accepted at data_rx_ms: wait out the meter's
+ * settle time, send the closing beacon, and take a 0x40 short ack or an
+ * authenticated repeat of the same data reply as closure. Unrelated or invalid
+ * frames are skipped without extending the window; no reply at all is a soft
+ * success (the data is already in hand). */
+static void close_get_(nartis_meter_t *m, uint64_t data_rx_ms, uint8_t expected, bool priming,
+                       int expected_invoke_id) {
+  uint64_t since = m->backend.millis(m->backend.ctx) - data_rx_ms;
+  if (since < READ_CLOSE_BEACON_DELAY_MS) sleep_ms(m, (uint32_t)(READ_CLOSE_BEACON_DELAY_MS - since));
+  uint8_t beacon[32], payload[256];
+  size_t bl = build_beacon(beacon, sizeof(beacon));
+  if (tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, bl) != NARTIS_OK) return;
+  uint64_t start = m->backend.millis(m->backend.ctx);
+  for (int f = 0; f < CLOSE_MAX_FRAMES; ++f) {
+    uint64_t el = m->backend.millis(m->backend.ctx) - start;
+    if (el + 300 >= m->cfg.rx_timeout_ms) break;
+    uint32_t to = f == 0 ? m->cfg.rx_reply_timeout_ms : (uint32_t)(m->cfg.rx_timeout_ms - el);
+    uint8_t t = 0;
+    int plen = rx_parse(m, payload, sizeof(payload), &t, to);
+    if (plen == NARTIS_ERR_TIMEOUT) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_DEBUG, "GET close: no ack, data already received");
+      return;
+    }
+    if (plen >= 0 && t == RX_TYPE_SHORT_ACK) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_DEBUG, "GET close: short ack");
+      return;
+    }
+    if (plen >= 0 && t == RX_TYPE_DATA &&
+        is_repeat_of_accepted_(m, payload, plen, expected, priming, expected_invoke_id)) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_INFO,
+                         "GET close: repeated data for invoke=%d - not stored again",
+                         expected_invoke_id);
+      return;
+    }
+    nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
+                       "GET close: unrelated/invalid frame (type 0x%02X, rc=%d) - keep waiting",
+                       t, plen);
+  }
+}
+
 /* Decrypt and validate one 0x43 data reply. Returns 1 if accepted, 0 if it was
  * rejected as stale/mismatched and the request should be re-sent (enforce mode
  * only), or a negative error. With enforcement off the behaviour is unchanged:
@@ -667,6 +736,7 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
   uint8_t payload[256], type;
   int plen = -1;
   bool have_data = false;
+  uint64_t data_rx_ms = 0;
 
   for (int req_try = 0; req_try < GET_REPLY_MAX_RETRIES && !have_data; ++req_try) {
     int rc = tx_dlms(m, apdu, apdu_len);
@@ -678,7 +748,7 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
       int r = accept_data_reply_(m, payload, plen, values, expected, class_ids, got, priming,
                                  expected_invoke_id);
       if (r < 0) return r;
-      if (r > 0) { have_data = true; break; }
+      if (r > 0) { have_data = true; data_rx_ms = m->backend.millis(m->backend.ctx); break; }
       sleep_ms(m, GET_REJECT_RESEND_DELAY_MS);
       continue;  /* rejected: re-send the same request */
     }
@@ -697,7 +767,7 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
           int r = accept_data_reply_(m, payload, plen, values, expected, class_ids, got, priming,
                                      expected_invoke_id);
           if (r < 0) return r;
-          if (r > 0) { have_data = true; break; }
+          if (r > 0) { have_data = true; data_rx_ms = m->backend.millis(m->backend.ctx); break; }
           sleep_ms(m, GET_REJECT_RESEND_DELAY_MS);
           break;  /* rejected: re-send the same request */
         }
@@ -708,31 +778,54 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
   }
   if (!have_data) return NARTIS_ERR_TIMEOUT;
 
-  /* closing beacon; the short ack that follows is not needed */
-  uint8_t beacon[32];
-  size_t bl = build_beacon(beacon, sizeof(beacon));
-  if (tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, bl) == NARTIS_OK) {
-    uint8_t at = 0;
-    (void) rx_parse(m, payload, sizeof(payload), &at, m->cfg.rx_reply_timeout_ms);
-  }
+  close_get_(m, data_rx_ms, expected, priming, expected_invoke_id);
   return NARTIS_OK;
 }
 
 /* Wake the meter, retrying a few times: a single frame lost to RF noise should
  * not fail the whole read. The meter answers with a short ack (0x40) or, when
  * already mid-session, a request ack (0x5B); a 0x53 means it is setting up a new
- * session, which is completed (GET_REKEYED). Noise/timeout is retried. */
+ * session, which is completed (GET_REKEYED).
+ * A 0x43 here is the previous read's last data reply, re-delivered because the
+ * meter still holds that session open: it is never decrypted or stored (so no
+ * counter moves), and the next beacon waits WAKE_STALE_DATA_DELAY_MS for the
+ * meter to settle (denis-isaev's wake retry). A frame that fails to parse is
+ * skipped and the radio re-armed while the window lasts; a timeout or another
+ * frame type re-sends the beacon. Bounded by WAKE_MAX_BEACONS beacons. */
 static int wake_meter_(nartis_meter_t *m) {
   uint8_t payload[256];
-  for (int wake_try = 0; wake_try < 3; ++wake_try) {
+  for (int wake_try = 0; wake_try < WAKE_MAX_BEACONS; ++wake_try) {
     uint8_t beacon[32];
     size_t beacon_len = build_beacon(beacon, sizeof(beacon));
     int rc = tx_frame(m, RF_FRAME_BEACON, m->beacon_seq++, beacon, beacon_len);
     if (rc != NARTIS_OK) return rc;
-    uint8_t type = 0;
-    int plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
-    if (plen >= 0 && (type == RX_TYPE_SHORT_ACK || type == RX_TYPE_REQUEST_ACK)) return NARTIS_OK;
-    if (plen >= 0 && type == RX_TYPE_SESSION_SETUP) return complete_rekey_(m, payload, plen);
+    uint64_t start = m->backend.millis(m->backend.ctx);
+    bool stale_data = false;
+    for (int f = 0; f <= MAX_RX_REARMS; ++f) {
+      uint64_t el = m->backend.millis(m->backend.ctx) - start;
+      if (f > 0 && el + 300 >= m->cfg.rx_timeout_ms) break;
+      uint8_t type = 0;
+      int plen = rx_parse(m, payload, sizeof(payload), &type, (uint32_t)(m->cfg.rx_timeout_ms - el));
+      if (plen >= 0 && (type == RX_TYPE_SHORT_ACK || type == RX_TYPE_REQUEST_ACK)) {
+        if (wake_try > 0)
+          nartis_backend_log(&m->backend, NARTIS_LOG_INFO, "wake: meter answered on beacon %d", wake_try + 1);
+        return NARTIS_OK;
+      }
+      if (plen >= 0 && type == RX_TYPE_SESSION_SETUP) return complete_rekey_(m, payload, plen);
+      if (plen >= 0 && type == RX_TYPE_DATA) { stale_data = true; break; }
+      if (plen >= 0 || plen == NARTIS_ERR_TIMEOUT) break;  /* other type / silence: re-beacon */
+      /* parse failure (CRC/noise): keep listening within the window */
+    }
+    if (stale_data) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_INFO,
+                         "wake: re-delivered data frame from the previous read (not stored) - "
+                         "waiting %d ms before beacon %d/%d",
+                         WAKE_STALE_DATA_DELAY_MS, wake_try + 2, WAKE_MAX_BEACONS);
+      if (wake_try + 1 < WAKE_MAX_BEACONS) sleep_ms(m, WAKE_STALE_DATA_DELAY_MS);
+    } else if (wake_try + 1 < WAKE_MAX_BEACONS) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_WARN, "wake: no usable answer - re-sending beacon (%d/%d)",
+                         wake_try + 2, WAKE_MAX_BEACONS);
+    }
   }
   return NARTIS_ERR_TIMEOUT;
 }
