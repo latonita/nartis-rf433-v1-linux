@@ -55,6 +55,7 @@ set -e
 #       --out "$SESSION"
 #
 #   ./build/nartisctl read --radio cc1101 --spi-dev "$SPI" \
-#       --meter-serial "$SERIAL" --ciu-address <same 16 hex CIU> \
+#       --meter-serial "$SERIAL" \
 #       --session "$SESSION" --alternative-channels --obis 1.0.1.7.0.255
+#   (the CIU address is taken from the session; --ciu-address is not needed)
 # ---------------------------------------------------------------------------

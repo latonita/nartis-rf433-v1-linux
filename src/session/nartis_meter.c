@@ -116,6 +116,24 @@ static void set_bootstrap_key(nartis_meter_t *m) {
   nartis_rf_set_aes_key(&m->rf, key);
 }
 
+/* A CIU serial that is unique to this host but stable across runs, so a device
+ * invents its own CIU address for fresh pairing without the user supplying one,
+ * and keeps the same one on later runs. Derived from /etc/machine-id; falls back
+ * to a fixed value if that is unavailable. */
+static void default_ciu_serial(char *out, size_t n) {
+  char mid[64] = {0};
+  FILE *f = fopen("/etc/machine-id", "r");
+  if (f) {
+    if (!fgets(mid, sizeof(mid), f)) mid[0] = 0;
+    fclose(f);
+  }
+  if (mid[0]) {
+    snprintf(out, n, "%010u", (unsigned) (simple_hash(mid) % 1000000000u));
+  } else {
+    snprintf(out, n, "NARTIS0000001");
+  }
+}
+
 static int derive_address(nartis_meter_t *m) {
   uint8_t b[8];
   if (m->ciu_address_hex[0]) {
@@ -124,7 +142,14 @@ static int derive_address(nartis_meter_t *m) {
     nartis_rf_set_address(&m->rf, nartis_rf_address_from_bytes(b));
     return NARTIS_OK;
   }
-  const char *serial = m->ciu_serial[0] ? m->ciu_serial : "NARTIS0000001";
+  char serbuf[32];
+  const char *serial;
+  if (m->ciu_serial[0]) {
+    serial = m->ciu_serial;
+  } else {
+    default_ciu_serial(serbuf, sizeof(serbuf));
+    serial = serbuf;
+  }
   nartis_rf_set_address(&m->rf, nartis_rf_address_derive(serial, simple_hash(serial)));
   return NARTIS_OK;
 }
@@ -166,9 +191,16 @@ int nartis_load_session(nartis_meter_t *m) {
   if (!m || !m->session_path[0]) return NARTIS_ERR_ARG;
   int rc = nartis_session_store_load(m->session_path, &m->session);
   if (rc != NARTIS_OK) return rc;
-  uint8_t ciu[8];
-  nartis_rf_address_to_bytes(&m->rf.address, ciu);
-  if (memcmp(ciu, m->session.ciu_addr, 8) != 0) return NARTIS_ERR_STATE;
+  if (m->ciu_address_hex[0]) {
+    /* An explicit CIU was given: the session must belong to it. */
+    uint8_t ciu[8];
+    nartis_rf_address_to_bytes(&m->rf.address, ciu);
+    if (memcmp(ciu, m->session.ciu_addr, 8) != 0) return NARTIS_ERR_STATE;
+  } else {
+    /* No CIU given: adopt the one the session was paired with, so a transplanted
+     * session needs no --ciu-address. */
+    nartis_rf_set_address(&m->rf, nartis_rf_address_from_bytes(m->session.ciu_addr));
+  }
   if (m->meter_serial[0] && memcmp(m->session.aes_key, m->meter_serial, 12) != 0) return NARTIS_ERR_STATE;
   sync_rf_from_session(m);
   return NARTIS_OK;

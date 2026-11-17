@@ -49,7 +49,7 @@ Pins are BCM GPIO numbers, not physical header pin numbers.
   --obis 1.0.1.7.0.255,class=3,attr=2
 ```
 
-If a meter is already paired with a real CIU, use `--ciu-address HEX16` to impersonate that exact 8-byte RF address.
+A CIU RF address is chosen automatically: a transplanted session supplies its own, and fresh pairing derives a stable per-host address. Pass `--ciu-address HEX16` only to force a specific address (for example to impersonate an existing CIU a meter is already paired with).
 
 ### CC1101 radio
 
@@ -74,7 +74,7 @@ CC1101 options: `--spi-dev PATH` (default `/dev/spidev0.0`), `--gdo0 N` (optiona
 
 ### Session transplant
 
-Instead of pairing, a device can start already paired by loading a session copied from another already-paired device. Generate the session file with `nartis_session_gen` (it uses the library's own store format) and read with the matching `--ciu-address`. Only one device may use a given session at a time, and set `--frame-counter` above the source device's last TX counter to avoid replay rejection.
+Instead of pairing, a device can start already paired by loading a session copied from another already-paired device. Generate the session file with `nartis_session_gen` (it uses the library's own store format) and read with it; the CIU address is taken from the session, so no `--ciu-address` is needed. Only one device may use a given session at a time, and set `--frame-counter` above the source device's last TX counter to avoid replay rejection.
 
 ```sh
 ./build/nartis_session_gen \
@@ -84,7 +84,7 @@ Instead of pairing, a device can start already paired by loading a session copie
   --frame-counter 1000 --out ./meter.session
 
 ./build/nartisctl read --radio cc1101 --spi-dev /dev/spidev0.0 \
-  --meter-serial 012345678901 --ciu-address <same 16 hex CIU> \
+  --meter-serial 012345678901 \
   --session ./meter.session --alternative-channels --obis 1.0.1.7.0.255
 ```
 
