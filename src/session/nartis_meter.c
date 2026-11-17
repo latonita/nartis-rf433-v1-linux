@@ -546,13 +546,64 @@ enum {
   PRIMING_MAX_POLL = 2,
 };
 
+enum { GET_REJECT_RESEND_DELAY_MS = 1000 };
+
+/* Decrypt and validate one 0x43 data reply. Returns 1 if accepted, 0 if it was
+ * rejected as stale/mismatched and the request should be re-sent (enforce mode
+ * only), or a negative error. With enforcement off the behaviour is unchanged:
+ * the first data reply is taken and any parse failure is fatal.
+ * A rejected reply has still been decrypted, so its nested counter has advanced;
+ * that is correct (it is a genuine, newer frame) and is not rolled back. */
+static int accept_data_reply_(nartis_meter_t *m, const uint8_t *payload, int plen,
+                              nartis_value_t *values, uint8_t expected,
+                              const uint16_t *class_ids, uint8_t *got, bool priming,
+                              int expected_invoke_id) {
+  const bool enforce = m->cfg.invoke_id_enforce;
+  uint8_t dlms[256];
+  int dlen = nartis_rf_parse_nested(&m->rf, payload, (size_t)plen, dlms, sizeof(dlms), true);
+  if (dlen < 0) {
+    if (enforce && dlen == NARTIS_ERR_REPLAY) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
+                         "GET reply rejected (replayed frame, sent=%d) - re-sending",
+                         expected_invoke_id);
+      return 0;
+    }
+    return dlen;
+  }
+  /* The priming request is a get-request-normal whose response is a throwaway
+   * used only to engage the session - it is not a with-list response, so do not
+   * parse it as one. Real batches use get-request-with-list. */
+  if (priming) return 1;
+
+  int resp_invoke = -1;
+  bool ok = nartis_dlms_parse_read_response_list(
+      dlms, (size_t)dlen, values, expected, got, class_ids,
+      enforce ? expected_invoke_id : -1, enforce, &resp_invoke);
+  /* Log the echo every time so the meter's invoke-id behaviour is observable
+   * even when enforcement is off. */
+  nartis_backend_log(&m->backend, NARTIS_LOG_INFO, "GET invoke: sent=%d recv=%d match=%s",
+                     expected_invoke_id, resp_invoke,
+                     (resp_invoke == (expected_invoke_id & 0x0F)) ? "yes" : "NO");
+  if (ok) return 1;
+  if (!enforce) return NARTIS_ERR_PROTOCOL;
+
+  /* Stale or mismatched reply: drop anything it wrote and re-send the same
+   * request (same invoke-id) within the retry budget. */
+  memset(values, 0, sizeof(values[0]) * expected);
+  if (got) *got = 0;
+  nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
+                     "GET reply rejected (sent=%d recv=%d) - re-sending",
+                     expected_invoke_id, resp_invoke);
+  return 0;
+}
+
 static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
                         nartis_value_t *values, uint8_t expected,
                         const uint16_t *class_ids, uint8_t *got, bool priming,
                         int expected_invoke_id) {
   const uint32_t poll_delay = priming ? PRIMING_POLL_BEACON_DELAY_MS : READ_POLL_BEACON_DELAY_MS;
   const int max_poll = priming ? PRIMING_MAX_POLL : READ_MAX_POLL;
-  uint8_t payload[256], dlms[256], type;
+  uint8_t payload[256], type;
   int plen = -1;
   bool have_data = false;
 
@@ -562,7 +613,14 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
     type = 0;
     plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
     if (plen >= 0 && type == RX_TYPE_SESSION_SETUP) { handle_rekey_(m, payload, plen, type); continue; }
-    if (plen >= 0 && type == RX_TYPE_DATA) { have_data = true; break; }
+    if (plen >= 0 && type == RX_TYPE_DATA) {
+      int r = accept_data_reply_(m, payload, plen, values, expected, class_ids, got, priming,
+                                 expected_invoke_id);
+      if (r < 0) return r;
+      if (r > 0) { have_data = true; break; }
+      sleep_ms(m, GET_REJECT_RESEND_DELAY_MS);
+      continue;  /* rejected: re-send the same request */
+    }
     if (plen >= 0 && (type == RX_TYPE_REQUEST_ACK || type == RX_TYPE_SHORT_ACK)) {
       /* request accepted; poll for the data with beacons after a settle gate */
       for (int p = 0; p < max_poll && !have_data; ++p) {
@@ -574,30 +632,20 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
         type = 0;
         plen = rx_parse(m, payload, sizeof(payload), &type, m->cfg.rx_timeout_ms);
         if (plen >= 0 && type == RX_TYPE_SESSION_SETUP) { handle_rekey_(m, payload, plen, type); break; }
-        if (plen >= 0 && type == RX_TYPE_DATA) have_data = true;
+        if (plen >= 0 && type == RX_TYPE_DATA) {
+          int r = accept_data_reply_(m, payload, plen, values, expected, class_ids, got, priming,
+                                     expected_invoke_id);
+          if (r < 0) return r;
+          if (r > 0) { have_data = true; break; }
+          sleep_ms(m, GET_REJECT_RESEND_DELAY_MS);
+          break;  /* rejected: re-send the same request */
+        }
       }
     }
-    /* otherwise (no reply, 0x40 not-ready, or a re-key): re-send the get-request */
+    /* otherwise (no reply, 0x40 not-ready, a re-key, or a rejected reply):
+     * re-send the get-request */
   }
   if (!have_data) return NARTIS_ERR_TIMEOUT;
-
-  int dlen = nartis_rf_parse_nested(&m->rf, payload, (size_t)plen, dlms, sizeof(dlms), true);
-  if (dlen < 0) return dlen;
-  /* The priming request is a get-request-normal whose response is a throwaway
-   * used only to engage the session - it is not a with-list response, so do not
-   * parse it as one. Real batches use get-request-with-list. */
-  if (!priming) {
-    int resp_invoke = -1;
-    bool ok = nartis_dlms_parse_read_response_list(
-        dlms, (size_t)dlen, values, expected, got, class_ids,
-        m->cfg.invoke_id_enforce ? expected_invoke_id : -1, m->cfg.invoke_id_enforce, &resp_invoke);
-    /* Log the echo every time so the meter's invoke-id behaviour is observable
-     * even when enforcement is off. */
-    nartis_backend_log(&m->backend, NARTIS_LOG_INFO, "GET invoke: sent=%d recv=%d match=%s",
-                       expected_invoke_id, resp_invoke,
-                       (resp_invoke == (expected_invoke_id & 0x0F)) ? "yes" : "NO");
-    if (!ok) return NARTIS_ERR_PROTOCOL;
-  }
 
   /* closing beacon; the short ack that follows is not needed */
   uint8_t beacon[32];
