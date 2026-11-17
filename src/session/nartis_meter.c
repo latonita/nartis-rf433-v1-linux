@@ -33,6 +33,8 @@ struct nartis_meter {
   uint8_t data_seq;
   uint8_t beacon_seq;
   uint8_t active_channel;
+  uint8_t next_get_invoke_id;  /* 4-bit counter, advances per logical GET */
+  uint8_t get_invoke_id;       /* invoke-id of the GET currently in flight */
   int8_t rssi[4];
   bool initialized;
   bool paired;
@@ -232,6 +234,7 @@ int nartis_open(nartis_meter_t **out, const nartis_config_t *cfg,
   m->data_seq = 2;
   m->beacon_seq = 1;
   m->active_channel = 2;
+  m->next_get_invoke_id = 1;
   int rc;
   if (m->cfg.radio_type == NARTIS_RADIO_CC1101) {
     rc = nartis_radio_open_cc1101(&m->radio, backend, &cfg->cc1101);
@@ -453,7 +456,8 @@ enum {
 
 static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
                         nartis_value_t *values, uint8_t expected,
-                        const uint16_t *class_ids, uint8_t *got, bool priming) {
+                        const uint16_t *class_ids, uint8_t *got, bool priming,
+                        int expected_invoke_id) {
   const uint32_t poll_delay = priming ? PRIMING_POLL_BEACON_DELAY_MS : READ_POLL_BEACON_DELAY_MS;
   const int max_poll = priming ? PRIMING_MAX_POLL : READ_MAX_POLL;
   uint8_t payload[256], dlms[256], type;
@@ -491,8 +495,16 @@ static int do_get_cycle(nartis_meter_t *m, const uint8_t *apdu, size_t apdu_len,
    * used only to engage the session - it is not a with-list response, so do not
    * parse it as one. Real batches use get-request-with-list. */
   if (!priming) {
-    if (!nartis_dlms_parse_read_response_list(dlms, (size_t)dlen, values, expected, got, class_ids))
-      return NARTIS_ERR_PROTOCOL;
+    int resp_invoke = -1;
+    bool ok = nartis_dlms_parse_read_response_list(
+        dlms, (size_t)dlen, values, expected, got, class_ids,
+        m->cfg.invoke_id_enforce ? expected_invoke_id : -1, m->cfg.invoke_id_enforce, &resp_invoke);
+    /* Log the echo every time so the meter's invoke-id behaviour is observable
+     * even when enforcement is off. */
+    nartis_backend_log(&m->backend, NARTIS_LOG_INFO, "GET invoke: sent=%d recv=%d match=%s",
+                       expected_invoke_id, resp_invoke,
+                       (resp_invoke == (expected_invoke_id & 0x0F)) ? "yes" : "NO");
+    if (!ok) return NARTIS_ERR_PROTOCOL;
   }
 
   /* closing beacon; the short ack that follows is not needed */
@@ -545,11 +557,15 @@ int nartis_read(nartis_meter_t *m, const nartis_attr_t *attrs, size_t attr_count
 
   if (!m->session_primed) {
     static const nartis_obis_t vendor = {{0x00,0x00,0x60,0x80,0x03,0xFF}};
+    m->get_invoke_id = m->next_get_invoke_id;
+    m->next_get_invoke_id = (uint8_t)((m->next_get_invoke_id + 1) & 0x0F);
     uint8_t apdu[32];
-    size_t apdu_len = nartis_dlms_build_get_request_normal(apdu, sizeof(apdu), &vendor, 1, 2);
+    size_t apdu_len = nartis_dlms_build_get_request_normal(apdu, sizeof(apdu), &vendor, 1, 2,
+                                                           m->get_invoke_id);
     nartis_value_t dummy[NARTIS_MAX_LIST_ATTRS];
     uint8_t got = 0;
-    rc = do_get_cycle(m, apdu, apdu_len, dummy, NARTIS_MAX_LIST_ATTRS, NULL, &got, true);
+    rc = do_get_cycle(m, apdu, apdu_len, dummy, NARTIS_MAX_LIST_ATTRS, NULL, &got, true,
+                      m->get_invoke_id);
     if (rc != NARTIS_OK) return rc;
     m->session_primed = true;
     if (m->session_path[0]) nartis_save_session(m);
@@ -559,8 +575,11 @@ int nartis_read(nartis_meter_t *m, const nartis_attr_t *attrs, size_t attr_count
   while (idx < attr_count) {
     uint8_t batch = (uint8_t)(attr_count - idx);
     if (batch > m->cfg.batch_size) batch = m->cfg.batch_size;
+    m->get_invoke_id = m->next_get_invoke_id;
+    m->next_get_invoke_id = (uint8_t)((m->next_get_invoke_id + 1) & 0x0F);
     uint8_t apdu[4 + 10 * NARTIS_MAX_LIST_ATTRS];
-    size_t apdu_len = nartis_dlms_build_get_request_with_list(apdu, sizeof(apdu), attrs + idx, batch);
+    size_t apdu_len = nartis_dlms_build_get_request_with_list(apdu, sizeof(apdu), attrs + idx, batch,
+                                                              m->get_invoke_id);
     if (!apdu_len) return NARTIS_ERR_ARG;
     uint16_t class_ids[NARTIS_MAX_LIST_ATTRS] = {0};
     for (uint8_t i = 0; i < batch; ++i) class_ids[i] = attrs[idx + i].class_id;
@@ -568,7 +587,8 @@ int nartis_read(nartis_meter_t *m, const nartis_attr_t *attrs, size_t attr_count
     int type_retries = 0;
     for (;;) {
       uint8_t got = 0;
-      rc = do_get_cycle(m, apdu, apdu_len, values + idx, batch, class_ids, &got, false);
+      rc = do_get_cycle(m, apdu, apdu_len, values + idx, batch, class_ids, &got, false,
+                        m->get_invoke_id);
       if (rc != NARTIS_OK) return rc;
       if (got != batch) return NARTIS_ERR_PROTOCOL;
 

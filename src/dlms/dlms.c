@@ -13,14 +13,15 @@ static uint64_t be64(const uint8_t *p) {
 }
 
 size_t nartis_dlms_build_get_request_with_list(uint8_t *out, size_t max,
-                                               const nartis_attr_t *attrs, uint8_t count) {
+                                               const nartis_attr_t *attrs, uint8_t count,
+                                               uint8_t invoke_id) {
   if (!out || !attrs || count == 0 || count > NARTIS_MAX_LIST_ATTRS) return 0;
   size_t needed = 4u + 10u * count;
   if (max < needed) return 0;
   size_t pos = 0;
   out[pos++] = 0xC0;
   out[pos++] = 0x03;
-  out[pos++] = 0xC1;
+  out[pos++] = 0xC0 | (invoke_id & 0x0F);  /* high priority, confirmed; 4-bit invoke-id */
   out[pos++] = count;
   for (uint8_t i = 0; i < count; ++i) {
     out[pos++] = (uint8_t)(attrs[i].class_id >> 8);
@@ -35,12 +36,13 @@ size_t nartis_dlms_build_get_request_with_list(uint8_t *out, size_t max,
 
 size_t nartis_dlms_build_get_request_normal(uint8_t *out, size_t max,
                                             const nartis_obis_t *obis,
-                                            uint16_t class_id, uint8_t attr_id) {
+                                            uint16_t class_id, uint8_t attr_id,
+                                            uint8_t invoke_id) {
   if (!out || !obis || max < 13) return 0;
   size_t pos = 0;
   out[pos++] = 0xC0;
   out[pos++] = 0x01;
-  out[pos++] = 0xC1;
+  out[pos++] = 0xC0 | (invoke_id & 0x0F);  /* high priority, confirmed; 4-bit invoke-id */
   out[pos++] = (uint8_t)(class_id >> 8);
   out[pos++] = (uint8_t)class_id;
   memcpy(out + pos, obis->bytes, 6);
@@ -165,16 +167,26 @@ static int parse_typed_value(const uint8_t *data, size_t len, nartis_value_t *va
 bool nartis_dlms_parse_read_response_list(const uint8_t *data, size_t len,
                                           nartis_value_t *values, uint8_t max_results,
                                           uint8_t *count_out,
-                                          const uint16_t *class_ids) {
+                                          const uint16_t *class_ids,
+                                          int expected_invoke_id, bool strict,
+                                          int *resp_invoke_out) {
   if (count_out) *count_out = 0;
+  if (resp_invoke_out) *resp_invoke_out = -1;
   if (!data || !values || len < 6) return false;
   size_t pos = 0;
   if (len >= 5 && data[0] == 0x0D && data[1] == 0xFD && data[2] == 0xF8) pos = 5;
   if (len < pos + 8 || data[pos] != 0x00 || data[pos + 1] != 0x01) return false;
+  size_t iec = pos;  /* IEC 62056-47 wrapper start (version + wPorts + length) */
   pos += 8;
   if (len < pos + 4 || data[pos] != 0xC4 || data[pos + 1] != 0x03) return false;
+  int resp_invoke = data[pos + 2] & 0x0F;
+  if (resp_invoke_out) *resp_invoke_out = resp_invoke;
   uint8_t count = data[pos + 3];
   pos += 4;
+  if (strict) {
+    if (expected_invoke_id >= 0 && resp_invoke != (expected_invoke_id & 0x0F)) return false;
+    if (be16(data + iec + 6) != (uint16_t)(len - iec - 8)) return false;
+  }
   uint8_t stored = 0;
   for (uint8_t i = 0; i < count && pos < len; ++i) {
     uint8_t result = data[pos++];
@@ -212,6 +224,7 @@ bool nartis_dlms_parse_read_response_list(const uint8_t *data, size_t len,
       }
     }
   }
+  if (strict && (stored != count || pos != len)) return false;
   if (count_out) *count_out = stored;
   return true;
 }

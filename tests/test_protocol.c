@@ -24,7 +24,7 @@ int main(void) {
   nartis_attr_t a = {.class_id = 3, .attr_id = 2};
   a.obis = obis;
   uint8_t apdu[32];
-  size_t n = nartis_dlms_build_get_request_with_list(apdu, sizeof(apdu), &a, 1);
+  size_t n = nartis_dlms_build_get_request_with_list(apdu, sizeof(apdu), &a, 1, 1);
   if (n != 14 || apdu[0] != 0xC0 || apdu[1] != 0x03 || apdu[3] != 1) return fail("dlms request");
 
   nartis_rf_ctx_t rf;

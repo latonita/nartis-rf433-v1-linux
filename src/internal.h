@@ -71,14 +71,18 @@ int nartis_rf_decrypt_with_key(const nartis_rf_ctx_t *ctx, const uint8_t key[16]
                                uint8_t *data, size_t len_with_tag, uint32_t counter);
 
 size_t nartis_dlms_build_get_request_with_list(uint8_t *out, size_t max,
-                                               const nartis_attr_t *attrs, uint8_t count);
+                                               const nartis_attr_t *attrs, uint8_t count,
+                                               uint8_t invoke_id);
 size_t nartis_dlms_build_get_request_normal(uint8_t *out, size_t max,
                                             const nartis_obis_t *obis,
-                                            uint16_t class_id, uint8_t attr_id);
+                                            uint16_t class_id, uint8_t attr_id,
+                                            uint8_t invoke_id);
 bool nartis_dlms_parse_read_response_list(const uint8_t *data, size_t len,
                                           nartis_value_t *values, uint8_t max_results,
                                           uint8_t *count_out,
-                                          const uint16_t *class_ids);
+                                          const uint16_t *class_ids,
+                                          int expected_invoke_id, bool strict,
+                                          int *resp_invoke_out);
 
 int nartis_session_store_load(const char *path, nartis_session_state_t *state);
 int nartis_session_store_save(const char *path, const nartis_session_state_t *state);
