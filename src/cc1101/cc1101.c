@@ -2,6 +2,7 @@
 #include "nartis/nartis_types.h"
 
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -371,6 +372,11 @@ int nartis_cc1101_poll_rx(nartis_cc1101_t *d, uint8_t *buf, size_t *len_io,
   size_t got = 0, expected = 0;
   uint8_t last_n = 0;
   uint64_t last_change = start;
+  /* Diagnostic: offsets at which each FIFO burst read started, so a corrupted
+   * byte in a bad frame can be checked against the read boundaries. */
+  enum { MAX_CHUNKS_LOGGED = 16 };
+  size_t chunk_at[MAX_CHUNKS_LOGGED];
+  int chunks = 0;
   *len_io = 0;
   while (millis(d) - start <= timeout_ms) {
     uint8_t st = rd_status_stable(d, S_RXBYTES);
@@ -381,6 +387,7 @@ int nartis_cc1101_poll_rx(nartis_cc1101_t *d, uint8_t *buf, size_t *len_io,
       got = 0;
       expected = 0;
       last_n = 0;
+      chunks = 0;
       delay_us(d, 500);
       continue;
     }
@@ -397,6 +404,8 @@ int nartis_cc1101_poll_rx(nartis_cc1101_t *d, uint8_t *buf, size_t *len_io,
     if (take == 0) { delay_us(d, 1000); continue; }
     if (expected && got + take > expected) take = expected - got;
     if (got + take > max_len) return NARTIS_ERR_PROTOCOL;
+    if (chunks < MAX_CHUNKS_LOGGED) chunk_at[chunks] = got;
+    chunks++;
     rd_burst(d, R_FIFO, buf + got, take);
     got += take;
     last_n = (uint8_t) (n - take);
@@ -412,10 +421,17 @@ int nartis_cc1101_poll_rx(nartis_cc1101_t *d, uint8_t *buf, size_t *len_io,
       uint8_t lqi = rd_status(d, S_LQI);
       int raw = rd_status(d, S_RSSI);
       int rssi = (raw >= 128) ? ((raw - 256) / 2 - 74) : (raw / 2 - 74);
+      char cs[8 * MAX_CHUNKS_LOGGED + 1];
+      size_t cp = 0;
+      cs[0] = '\0';
+      for (int i = 0; i < chunks && i < MAX_CHUNKS_LOGGED && cp + 8 < sizeof(cs); ++i)
+        cp += (size_t) snprintf(cs + cp, sizeof(cs) - cp, "%s%zu", i ? "," : "", chunk_at[i]);
       nartis_backend_log(&d->backend, NARTIS_LOG_DEBUG,
-                         "CC1101 RX %zu B: FREQEST=%d (%+ld Hz, freq_offset %+ld) LQI=0x%02X RSSI=%d dBm",
+                         "CC1101 RX %zu B: FREQEST=%d (%+ld Hz, freq_offset %+ld) LQI=0x%02X RSSI=%d dBm"
+                         " reads@%s%s",
                          expected, (int) est, (long) ((long) est * 26000000L / 16384L),
-                         (long) d->cfg.freq_offset_hz, lqi, rssi);
+                         (long) d->cfg.freq_offset_hz, lqi, rssi, cs,
+                         chunks > MAX_CHUNKS_LOGGED ? ",..." : "");
       return NARTIS_OK;
     }
   }
