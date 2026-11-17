@@ -11,6 +11,9 @@ find_package(OpenSSL REQUIRED)
 
 add_library(nartis
   src/cmt2300a/cmt2300a.c
+  src/cc1101/cc1101.c
+  src/radio/radio_cmt2300a.c
+  src/radio/radio_cc1101.c
   src/dlms/dlms.c
   src/dlms/obis.c
   src/platform/backend_sysfs.c
@@ -30,6 +33,10 @@ target_link_libraries(nartis PUBLIC OpenSSL::Crypto)
 if(NARTIS_BUILD_TOOLS)
   add_executable(nartisctl tools/nartisctl.c)
   target_link_libraries(nartisctl PRIVATE nartis)
+
+  add_executable(nartis_session_gen tools/nartis_session_gen.c)
+  target_include_directories(nartis_session_gen PRIVATE src)
+  target_link_libraries(nartis_session_gen PRIVATE nartis)
 endif()
 
 if(NARTIS_BUILD_TESTS)

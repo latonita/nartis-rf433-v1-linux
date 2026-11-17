@@ -1,8 +1,10 @@
 #ifndef NARTIS_H
 #define NARTIS_H
 
+#include "cc1101.h"
 #include "cmt2300a.h"
 #include "nartis_backend.h"
+#include "nartis_radio.h"
 #include "nartis_types.h"
 
 #ifdef __cplusplus
@@ -12,7 +14,9 @@ extern "C" {
 typedef struct nartis_meter nartis_meter_t;
 
 typedef struct {
-  nartis_cmt2300a_pins_t pins;
+  nartis_radio_type_t radio_type;   /* CMT2300A (default) or CC1101 */
+  nartis_cmt2300a_pins_t pins;      /* CMT2300A wiring */
+  nartis_cc1101_config_t cc1101;    /* CC1101 settings (spi_dev, gdo0, freq_offset) */
   const char *meter_serial;
   const char *ciu_serial;
   const char *ciu_address_hex;

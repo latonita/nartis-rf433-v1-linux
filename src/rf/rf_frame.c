@@ -109,7 +109,7 @@ void nartis_rf_address_to_bytes(const nartis_rf_address_t *addr, uint8_t out[8])
 }
 
 nartis_rf_address_t nartis_rf_address_from_bytes(const uint8_t in[8]) {
-  nartis_rf_address_t a;
+  nartis_rf_address_t a = {0};
   a.manufacturer_id = (uint16_t)in[0] | ((uint16_t)in[1] << 8);
   a.address_id = (uint32_t)in[2] | ((uint32_t)in[3] << 8) | ((uint32_t)in[4] << 16) | ((uint32_t)in[5] << 24);
   a.version = in[6];
@@ -216,8 +216,11 @@ int nartis_rf_parse_frame(nartis_rf_ctx_t *ctx, const uint8_t *in, size_t in_len
   if (body_size < 0) return NARTIS_ERR_CRC;
   if (type_out) *type_out = ctx->work[RF_RX_TYPE];
   if (ctx->meter_address_set) {
-    nartis_rf_address_t src = nartis_rf_address_from_bytes(ctx->work + RF_RX_ADDR);
-    if (memcmp(&src, &ctx->meter_address, sizeof(src)) != 0) return NARTIS_ERR_PROTOCOL;
+    /* Compare by the 8-byte wire form, not the struct: nartis_rf_address_t has
+     * padding bytes that a struct memcmp would include. */
+    uint8_t mb[8];
+    nartis_rf_address_to_bytes(&ctx->meter_address, mb);
+    if (memcmp(ctx->work + RF_RX_ADDR, mb, 8) != 0) return NARTIS_ERR_PROTOCOL;
   }
   uint8_t frame_type = ctx->work[RF_RX_TYPE];
   bool plain = frame_type == RX_TYPE_PRESENCE_ACK || frame_type == RX_TYPE_SHORT_ACK ||
