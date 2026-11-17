@@ -10,6 +10,8 @@ enum {
   MAX_RETRIES = 3,
   MAX_LEARNED_TYPES = 32,
   MAX_BATCH_TYPE_RETRIES = 2,
+  MAX_PAIR_ACK_RETRIES = 4,
+  MAX_RX_REARMS = 3,
 };
 
 /* Per-OBIS learned DLMS type/length, used to reject a value whose type/len does
@@ -337,7 +339,52 @@ static int rx_parse(nartis_meter_t *m, uint8_t *payload, size_t payload_max,
   if (!m->rf.meter_address_set && frame_len >= 10) {
     nartis_rf_set_meter_address(&m->rf, nartis_rf_address_from_bytes(frame + 2));
   }
-  return nartis_rf_parse_frame(&m->rf, frame, frame_len, payload, payload_max, type);
+  int prc = nartis_rf_parse_frame(&m->rf, frame, frame_len, payload, payload_max, type);
+  /* Diagnostic: on a frame that fails to parse, dump it raw (L-field first) so a
+   * bad CRC can be traced to where the stream broke. Good frames are not dumped:
+   * a 0x53 carries the data key. */
+  if (prc < 0) {
+    char hex[3 * NARTIS_MAX_RF_FRAME_SIZE + 1];
+    size_t hp = 0;
+    for (size_t i = 0; i < frame_len && hp + 3 < sizeof(hex); ++i)
+      hp += (size_t) snprintf(hex + hp, sizeof(hex) - hp, "%02X ", frame[i]);
+    hex[hp] = '\0';
+    nartis_backend_log(&m->backend, NARTIS_LOG_WARN, "RX frame len=%zu type=0x%02X rc=%d: %s",
+                       frame_len, frame_len > 1 ? frame[1] : 0, prc, hex);
+  } else {
+    nartis_backend_log(&m->backend, NARTIS_LOG_DEBUG, "RX frame len=%zu type=0x%02X ok",
+                       frame_len, frame_len > 1 ? frame[1] : 0);
+  }
+  return prc;
+}
+
+/* Listen for up to timeout_ms for a frame whose type is in want[]. A frame of
+ * another type, or one that fails to parse (CRC/noise), is skipped and the
+ * radio re-armed while enough of the window remains - the ESPHome component's
+ * re-arm. Returns the payload length of an accepted frame (type in *type), or
+ * the most informative error seen (timeout if nothing at all arrived). */
+static int rx_expect(nartis_meter_t *m, uint8_t *payload, size_t payload_max, uint8_t *type,
+                     uint32_t timeout_ms, const uint8_t *want, size_t n_want) {
+  uint64_t start = m->backend.millis(m->backend.ctx);
+  int last = NARTIS_ERR_TIMEOUT;
+  for (int tries = 0; tries <= MAX_RX_REARMS; ++tries) {
+    uint64_t el = m->backend.millis(m->backend.ctx) - start;
+    if (tries > 0 && el + 300 >= timeout_ms) break;
+    uint8_t t = 0;
+    int plen = rx_parse(m, payload, payload_max, &t, (uint32_t)(timeout_ms - el));
+    if (plen == NARTIS_ERR_TIMEOUT) return last;
+    if (plen >= 0) {
+      for (size_t i = 0; i < n_want; ++i) {
+        if (t == want[i]) { *type = t; return plen; }
+      }
+      last = NARTIS_ERR_PROTOCOL;
+    } else {
+      last = plen;
+    }
+    nartis_backend_log(&m->backend, NARTIS_LOG_WARN, "skipping frame (type 0x%02X, rc=%d), re-listening",
+                       t, plen);
+  }
+  return last;
 }
 
 static int select_channel(nartis_meter_t *m) {
@@ -378,32 +425,77 @@ int nartis_pair(nartis_meter_t *m) {
   size_t probe_len = build_pair_probe(m, probe, sizeof(probe));
   if (!probe_len) return NARTIS_ERR_ARG;
 
+  /* Step 1: probe until the meter answers with a presence ack (0x06). */
+  static const uint8_t want_presence[] = {RX_TYPE_PRESENCE_ACK};
+  int plen = NARTIS_ERR_TIMEOUT;
   for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
     int rc = tx_frame(m, RF_FRAME_DATA, m->data_seq++, probe, probe_len);
     if (rc != NARTIS_OK) return rc;
-    int plen = rx_parse(m, payload, sizeof(payload), &rx_type, m->cfg.rx_timeout_ms);
-    if (plen >= 0 && rx_type == RX_TYPE_PRESENCE_ACK) break;
-    if (attempt == MAX_RETRIES - 1) return plen < 0 ? plen : NARTIS_ERR_PROTOCOL;
+    plen = rx_expect(m, payload, sizeof(payload), &rx_type, m->cfg.rx_timeout_ms,
+                     want_presence, sizeof(want_presence));
+    if (plen >= 0) break;
+    if (attempt == MAX_RETRIES - 1) return plen;
     sleep_ms(m, 2300);
   }
 
-  sleep_ms(m, 637);
-  uint8_t beacon[32];
-  size_t beacon_len = build_beacon(beacon, sizeof(beacon));
-  int rc = tx_frame(m, RF_FRAME_ACK, m->data_seq++, beacon, beacon_len);
-  if (rc != NARTIS_OK) return rc;
-  int plen = rx_parse(m, payload, sizeof(payload), &rx_type, m->cfg.rx_timeout_ms);
-  if (plen < 0 || rx_type != RX_TYPE_SESSION_SETUP) return plen < 0 ? plen : NARTIS_ERR_PROTOCOL;
-  uint8_t key[16];
-  if (nartis_rf_extract_session_key(&m->rf, payload, (size_t)plen, key)) {
-    nartis_rf_set_aes_key(&m->rf, key);
+  /* Step 2: encrypted ACK until the meter ships its session setup (0x53) with
+   * the data key. Retried like the ESPHome component: a missed or corrupted
+   * 0x53 is simply retransmitted by the meter on the next ACK. A meter that
+   * answers 0x5B/0x40 here already considers us paired. */
+  static const uint8_t want_setup[] = {RX_TYPE_SESSION_SETUP, RX_TYPE_REQUEST_ACK, RX_TYPE_SHORT_ACK};
+  bool got_key = false, got_reply = false;
+  for (int ack_try = 0; ack_try < MAX_PAIR_ACK_RETRIES && !got_reply; ++ack_try) {
+    sleep_ms(m, ack_try == 0 ? 637 : 2300);
+    uint8_t beacon[32];
+    size_t beacon_len = build_beacon(beacon, sizeof(beacon));
+    int rc = tx_frame(m, RF_FRAME_ACK, m->data_seq++, beacon, beacon_len);
+    if (rc != NARTIS_OK) return rc;
+    plen = rx_expect(m, payload, sizeof(payload), &rx_type, m->cfg.rx_timeout_ms,
+                     want_setup, sizeof(want_setup));
+    if (plen < 0) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_WARN, "pair: no session setup (try %d/%d, rc=%d)",
+                         ack_try + 1, MAX_PAIR_ACK_RETRIES, plen);
+      continue;
+    }
+    got_reply = true;
+    if (rx_type != RX_TYPE_SESSION_SETUP) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
+                         "pair: meter answered 0x%02X instead of 0x53 - keeping current key", rx_type);
+      break;
+    }
+    uint8_t key[16];
+    size_t sn = strlen(m->meter_serial);
+    if (nartis_rf_extract_session_key(&m->rf, payload, (size_t)plen, key) &&
+        sn >= 12 && memcmp(key, m->meter_serial, 12) == 0) {
+      nartis_rf_set_aes_key(&m->rf, key);
+      got_key = true;
+      nartis_backend_log(&m->backend, NARTIS_LOG_INFO, "pair: session setup received, data key installed");
+    } else {
+      nartis_backend_log(&m->backend, NARTIS_LOG_WARN, "pair: 0x53 without a usable key - keeping current key");
+    }
+  }
+  if (!got_reply) return plen < 0 ? plen : NARTIS_ERR_PROTOCOL;
+  if (got_key) {
+    /* Fresh key, fresh counters (as the ESPHome component does after 0x53). */
+    m->rf.frame_counter = 0;
+    m->rf.has_sent_first_tx = false;
+    m->rf.last_rx_counter = 0;
+    m->rf.last_nested_rx_counter = 0;
   }
 
-  sleep_ms(m, 5629);
-  rc = tx_frame(m, RF_FRAME_PLAIN_DATA, m->beacon_seq++, probe, probe_len);
-  if (rc != NARTIS_OK) return rc;
-  plen = rx_parse(m, payload, sizeof(payload), &rx_type, m->cfg.rx_timeout_ms);
-  if (plen < 0 || (rx_type != RX_TYPE_REQUEST_ACK && rx_type != RX_TYPE_SHORT_ACK)) return plen < 0 ? plen : NARTIS_ERR_PROTOCOL;
+  /* Step 3: mode-6 confirmation. The meter normally answers 0x5B/0x40; the key
+   * is already installed, so a missing answer is logged but not fatal. */
+  static const uint8_t want_ready[] = {RX_TYPE_REQUEST_ACK, RX_TYPE_SHORT_ACK};
+  if (got_key) {
+    sleep_ms(m, 5629);
+    int rc = tx_frame(m, RF_FRAME_PLAIN_DATA, m->beacon_seq++, probe, probe_len);
+    if (rc != NARTIS_OK) return rc;
+    plen = rx_expect(m, payload, sizeof(payload), &rx_type, m->cfg.rx_timeout_ms,
+                     want_ready, sizeof(want_ready));
+    if (plen < 0)
+      nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
+                         "pair: no ready answer to mode-6 (rc=%d) - proceeding with installed key", plen);
+  }
   m->paired = true;
   m->session_primed = false;
   if (m->session_path[0]) nartis_save_session(m);
