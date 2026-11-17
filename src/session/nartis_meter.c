@@ -738,9 +738,12 @@ static int wake_meter_(nartis_meter_t *m) {
 }
 
 /* Sacrificial get-request-normal that engages the meter's session; its answer
- * is discarded. Returns NARTIS_OK, GET_REKEYED or an error. */
+ * is discarded. Sent on EVERY read, after the wake: the meter treats the first
+ * GET of each wake session as a service request whose answer can arrive on the
+ * next GET, so skipping it lets a delayed answer land on the first real batch.
+ * The persisted session_primed flag is kept for file compatibility but no
+ * longer suppresses priming. Returns NARTIS_OK, GET_REKEYED or an error. */
 static int prime_session_(nartis_meter_t *m) {
-  if (m->session_primed) return NARTIS_OK;
   static const nartis_obis_t vendor = {{0x00,0x00,0x60,0x80,0x03,0xFF}};
   m->get_invoke_id = m->next_get_invoke_id;
   m->next_get_invoke_id = (uint8_t)((m->next_get_invoke_id + 1) & 0x0F);
