@@ -59,6 +59,12 @@ size_t nartis_rf_build_frame(nartis_rf_ctx_t *ctx, uint8_t *out, size_t out_max,
                              const uint8_t *payload, size_t payload_len);
 int nartis_rf_parse_frame(nartis_rf_ctx_t *ctx, const uint8_t *in, size_t in_len,
                           uint8_t *payload_out, size_t payload_max, uint8_t *type_out);
+/* True if `in` is a CRC-valid frame sent BY a CIU TO the meter (the meter's own
+ * display, or another reader): a CIU frame type at [1] (0x08/0x46/0x44/0x00,
+ * never used by the meter) and a sender device type at [9] other than the
+ * meter's 0x02. A radio never receives its own transmission, so such a frame is
+ * never ours and never the meter's reply. */
+bool nartis_rf_is_ciu_frame(nartis_rf_ctx_t *ctx, const uint8_t *in, size_t in_len);
 int nartis_rf_parse_nested(nartis_rf_ctx_t *ctx, const uint8_t *payload, size_t payload_len,
                            uint8_t *plain_out, size_t plain_max, bool mutate_counter);
 bool nartis_rf_extract_session_key(const nartis_rf_ctx_t *ctx, const uint8_t *payload,
@@ -71,14 +77,18 @@ int nartis_rf_decrypt_with_key(const nartis_rf_ctx_t *ctx, const uint8_t key[16]
                                uint8_t *data, size_t len_with_tag, uint32_t counter);
 
 size_t nartis_dlms_build_get_request_with_list(uint8_t *out, size_t max,
-                                               const nartis_attr_t *attrs, uint8_t count);
+                                               const nartis_attr_t *attrs, uint8_t count,
+                                               uint8_t invoke_id);
 size_t nartis_dlms_build_get_request_normal(uint8_t *out, size_t max,
                                             const nartis_obis_t *obis,
-                                            uint16_t class_id, uint8_t attr_id);
+                                            uint16_t class_id, uint8_t attr_id,
+                                            uint8_t invoke_id);
 bool nartis_dlms_parse_read_response_list(const uint8_t *data, size_t len,
                                           nartis_value_t *values, uint8_t max_results,
                                           uint8_t *count_out,
-                                          const uint16_t *class_ids);
+                                          const uint16_t *class_ids,
+                                          int expected_invoke_id, bool strict,
+                                          int *resp_invoke_out);
 
 int nartis_session_store_load(const char *path, nartis_session_state_t *state);
 int nartis_session_store_save(const char *path, const nartis_session_state_t *state);

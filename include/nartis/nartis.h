@@ -23,6 +23,7 @@ typedef struct {
   int fixed_channel;
   bool use_alternative_channels;
   uint8_t batch_size;
+  bool invoke_id_enforce;           /* reject GET responses whose invoke-id does not echo the request */
   uint32_t rx_timeout_ms;
   uint32_t rx_reply_timeout_ms;
   const char *session_path;

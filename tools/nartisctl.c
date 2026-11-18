@@ -12,6 +12,7 @@ static void usage(FILE *f) {
     "  nartisctl read    --meter-serial S --session PATH --obis A.B.C.D.E.F[,class=N,attr=N] ... pins...\n"
     "\n"
     "Options: --ciu-serial S --ciu-address HEX16 --fixed-channel N --alternative-channels --batch-size N\n"
+    "         --invoke-enforce         reject GET responses whose invoke-id does not echo the request\n"
     "\n"
     "Radio (default CMT2300A, bit-banged SPI via --sdio/--sclk/--csb/--fcsb/--gpio3):\n"
     "  --radio cc1101            use a CC1101 on a kernel SPI device instead\n"
@@ -75,6 +76,7 @@ int main(int argc, char **argv) {
     else if (strcmp(a, "--fixed-channel") == 0) cfg.fixed_channel = parse_u(argval(&i, argc, argv));
     else if (strcmp(a, "--alternative-channels") == 0) cfg.use_alternative_channels = true;
     else if (strcmp(a, "--batch-size") == 0) cfg.batch_size = (uint8_t)parse_u(argval(&i, argc, argv));
+    else if (strcmp(a, "--invoke-enforce") == 0) cfg.invoke_id_enforce = true;
     else if (strcmp(a, "--radio") == 0) {
       const char *v = argval(&i, argc, argv);
       if (v && strcmp(v, "cc1101") == 0) cfg.radio_type = NARTIS_RADIO_CC1101;

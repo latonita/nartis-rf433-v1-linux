@@ -2,6 +2,7 @@
 #include "nartis/nartis_types.h"
 
 #include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -31,7 +32,8 @@ enum {
 };
 /* Status registers (read with burst bit) */
 enum {
-  S_PARTNUM = 0x30, S_VERSION = 0x31, S_RSSI = 0x34, S_MARCSTATE = 0x35,
+  S_PARTNUM = 0x30, S_VERSION = 0x31, S_FREQEST = 0x32, S_LQI = 0x33,
+  S_RSSI = 0x34, S_MARCSTATE = 0x35,
   S_TXBYTES = 0x3A, S_RXBYTES = 0x3B,
 };
 enum { R_PATABLE = 0x3E, R_FIFO = 0x3F };
@@ -43,6 +45,8 @@ enum {
 
 #define MARC_MASK 0x1F
 #define MARC_IDLE 0x01
+#define MARC_RX 0x0D
+#define RX_HOLDBACK_STALL_MS 30  /* ~9 byte times at 2400 baud */
 #define MDMCFG2_BASE 0x12  /* GFSK + 16/16 sync (F6 72) */
 #define SYNC_HI 0xF6
 #define SYNC_LO 0x72
@@ -111,6 +115,19 @@ static void rd_burst(nartis_cc1101_t *d, uint8_t addr, uint8_t *b, size_t n) {
 }
 
 static uint8_t marcstate(nartis_cc1101_t *d) { return rd_status(d, S_MARCSTATE) & MARC_MASK; }
+
+/* Errata "SPI read synchronization": a status register that changes while it
+ * is shifted out can read as a value it never held (classically a bogus
+ * RXBYTES). Read until two consecutive reads agree. */
+static uint8_t rd_status_stable(nartis_cc1101_t *d, uint8_t addr) {
+  uint8_t prev = rd_status(d, addr);
+  for (int i = 0; i < 6; ++i) {
+    uint8_t cur = rd_status(d, addr);
+    if (cur == prev) return cur;
+    prev = cur;
+  }
+  return prev;
+}
 
 static int wait_idle(nartis_cc1101_t *d, uint32_t timeout_ms) {
   uint64_t start = millis(d);
@@ -353,30 +370,68 @@ int nartis_cc1101_poll_rx(nartis_cc1101_t *d, uint8_t *buf, size_t *len_io,
   if (!d || !buf || !len_io || !d->rx_active) return NARTIS_ERR_ARG;
   uint64_t start = millis(d);
   size_t got = 0, expected = 0;
+  uint8_t last_n = 0;
+  uint64_t last_change = start;
+  /* Diagnostic: offsets at which each FIFO burst read started, so a corrupted
+   * byte in a bad frame can be checked against the read boundaries. */
+  enum { MAX_CHUNKS_LOGGED = 16 };
+  size_t chunk_at[MAX_CHUNKS_LOGGED];
+  int chunks = 0;
   *len_io = 0;
   while (millis(d) - start <= timeout_ms) {
-    uint8_t st = rd_status(d, S_RXBYTES);
+    uint8_t st = rd_status_stable(d, S_RXBYTES);
     if (st & 0x80) {  /* RX FIFO overflow */
+      strobe(d, CS_SIDLE);
       strobe(d, CS_SFRX);
       strobe(d, CS_SRX);
       got = 0;
       expected = 0;
+      last_n = 0;
+      chunks = 0;
       delay_us(d, 500);
       continue;
     }
     uint8_t n = st & 0x7F;
+    uint64_t now = millis(d);
+    if (n != last_n) { last_n = n; last_change = now; }
     if (n == 0) { delay_us(d, 1000); continue; }
     size_t take = n;
+    /* Errata SWRZ020E: emptying the RX FIFO while the demodulator is still
+     * writing into it can return a byte that was never received. While in RX,
+     * leave the last byte behind (infinite-length mode keeps demodulating, so
+     * more bytes arrive behind it); take it only if the count has stalled. */
+    if (marcstate(d) == MARC_RX && now - last_change < RX_HOLDBACK_STALL_MS) take = n - 1;
+    if (take == 0) { delay_us(d, 1000); continue; }
     if (expected && got + take > expected) take = expected - got;
     if (got + take > max_len) return NARTIS_ERR_PROTOCOL;
+    if (chunks < MAX_CHUNKS_LOGGED) chunk_at[chunks] = got;
+    chunks++;
     rd_burst(d, R_FIFO, buf + got, take);
     got += take;
+    last_n = (uint8_t) (n - take);
+    last_change = millis(d);
     if (!expected && got >= 1) {
       expected = (size_t) buf[0] + 1;
       if (expected > max_len) return NARTIS_ERR_PROTOCOL;
     }
     if (expected && got >= expected) {
       *len_io = expected;
+      /* Diagnostic: FREQEST = received carrier minus our tuning (~1587 Hz/step). */
+      int8_t est = (int8_t) rd_status(d, S_FREQEST);
+      uint8_t lqi = rd_status(d, S_LQI);
+      int raw = rd_status(d, S_RSSI);
+      int rssi = (raw >= 128) ? ((raw - 256) / 2 - 74) : (raw / 2 - 74);
+      char cs[8 * MAX_CHUNKS_LOGGED + 1];
+      size_t cp = 0;
+      cs[0] = '\0';
+      for (int i = 0; i < chunks && i < MAX_CHUNKS_LOGGED && cp + 8 < sizeof(cs); ++i)
+        cp += (size_t) snprintf(cs + cp, sizeof(cs) - cp, "%s%zu", i ? "," : "", chunk_at[i]);
+      nartis_backend_log(&d->backend, NARTIS_LOG_DEBUG,
+                         "CC1101 RX %zu B: FREQEST=%d (%+ld Hz, freq_offset %+ld) LQI=0x%02X RSSI=%d dBm"
+                         " reads@%s%s",
+                         expected, (int) est, (long) ((long) est * 26000000L / 16384L),
+                         (long) d->cfg.freq_offset_hz, lqi, rssi, cs,
+                         chunks > MAX_CHUNKS_LOGGED ? ",..." : "");
       return NARTIS_OK;
     }
   }

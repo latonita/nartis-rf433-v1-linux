@@ -206,6 +206,20 @@ size_t nartis_rf_build_frame(nartis_rf_ctx_t *ctx, uint8_t *out, size_t out_max,
   return total;
 }
 
+bool nartis_rf_is_ciu_frame(nartis_rf_ctx_t *ctx, const uint8_t *in, size_t in_len) {
+  if (!ctx || !in || in_len < RF_RX_HDR_SIZE + 2) return false;
+  const uint8_t t = in[RF_RX_TYPE];
+  if (t != RF_FRAME_BEACON && t != RF_FRAME_DATA && t != RF_FRAME_ACK && t != RF_FRAME_PLAIN_DATA)
+    return false;
+  if (in[RF_RX_ADDR + 7] == NARTIS_RF_DEVICE_TYPE_METER) return false;
+  /* CRC last, and only for CIU-typed frames: a noise burst that happens to
+   * start with one of those bytes must not be mistaken for a display. */
+  size_t frame_size = (size_t)in[RF_RX_LENGTH] + 1;
+  if (frame_size > in_len || frame_size > sizeof(ctx->work)) return false;
+  memcpy(ctx->work, in, frame_size);
+  return crc_strip(ctx->work, frame_size) >= 0;
+}
+
 int nartis_rf_parse_frame(nartis_rf_ctx_t *ctx, const uint8_t *in, size_t in_len,
                           uint8_t *payload_out, size_t payload_max, uint8_t *type_out) {
   if (!ctx || !in || in_len < RF_RX_HDR_SIZE + 2) return NARTIS_ERR_PROTOCOL;
