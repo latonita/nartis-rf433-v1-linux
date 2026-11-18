@@ -1,122 +1,255 @@
-# Nartis RF433 Linux Library
+# Nartis RF433 для Linux
 
-Standalone C API and CLI for talking to Nartis RF433 meters from a Linux computer, initially Raspberry Pi. Two radios are supported, selected at runtime: a **CMT2300A** on bit-banged 3-wire SPI, or a **CC1101** on a kernel SPI device (`/dev/spidevX.Y`).
+Библиотека на C и утилита командной строки `nartisctl` для чтения счётчиков **Нартис И100 / И300** по радиоканалу 433 МГц с обычного Linux-компьютера (проверено на Raspberry Pi).
 
-The project ports the working ESPHome component into Linux-friendly layers:
+Программа работает так же, как выносной дисплей **Нартис Д101**: один раз **сопрягается** со счётчиком, а потом по запросу **читает показания** по их OBIS-кодам (напряжение, мощность, энергия и т.д.). Результат выводится в JSON - его удобно забирать скриптом, в Home Assistant, Node-RED и т.п.
 
-- `radio`: a small vtable so the protocol layers are radio-agnostic.
-- `cmt2300a`: bit-banged 3-wire SPI, register banks, FIFO, RSSI scan, TX/RX.
-- `cc1101`: kernel spidev driver; hardware sync off on TX with a clean preamble + `F6 72` from the FIFO, 16/16 sync on RX, per-module crystal correction.
-- `rf`: Nartis RF framing, CRC-16/DNP, AES-128-GCM, counters, nested response decrypt.
-- `dlms`: OBIS parsing, DLMS get-request builders, response/value parsing.
-- `session`: pairing, persistent session state, blocking read cycle.
-- `platform`: GPIO/time/log backend. The included backend uses Linux sysfs GPIO.
+Это порт ESPHome-компонента [esphome-nartis-rf-meter](https://github.com/latonita/esphome-nartis-rf-meter) под Linux.
 
-## Build
+## Что понадобится
+
+- Linux-компьютер с SPI или свободными GPIO (например, Raspberry Pi).
+- Радиомодуль на 433 МГц, один из двух:
+  - **CC1101** - подключается к аппаратному SPI (`/dev/spidev0.0`). Рекомендуется.
+  - **CMT2300A** - подключается к любым 5 GPIO (программный 3-проводной SPI).
+- Серийный номер счётчика - 12 цифр с шильдика, например `012345678901`.
+- Счётчик в радиусе действия радио.
+
+## Сборка
 
 ```sh
+sudo apt install build-essential cmake libssl-dev
+git clone https://github.com/latonita/nartis-rf433-v1-linux.git
+cd nartis-rf433-v1-linux
 cmake -S . -B build
 cmake --build build
+```
+
+Проверка (необязательно):
+
+```sh
 ctest --test-dir build --output-on-failure
 ```
 
-OpenSSL crypto is required for AES-GCM.
+Готовая утилита: `./build/nartisctl`.
 
-## CLI
+## Быстрый старт с CC1101
 
-Pins are BCM GPIO numbers, not physical header pin numbers.
+Три шага: проверить модуль, сопрячься, читать. Вместо `012345678901` подставьте номер своего счётчика.
+
+### 1. Включить SPI и проверить модуль
+
+На Raspberry Pi включите SPI: `sudo raspi-config` → Interface Options → SPI → Enable, затем перезагрузка.
 
 ```sh
-./build/nartisctl chip-id \
-  --sdio 23 --sclk 18 --csb 27 --fcsb 26 --gpio3 14
+./build/nartisctl chip-id --radio cc1101 --spi-dev /dev/spidev0.0
 ```
+
+Ожидаемый ответ:
+
+```
+CC1101 connected (spi=/dev/spidev0.0)
+```
+
+Если пишет `CC1101 not detected` - проверьте проводку и номер `spidev`.
+
+### 2. Сопряжение (один раз)
 
 ```sh
 ./build/nartisctl pair \
+  --radio cc1101 --spi-dev /dev/spidev0.0 \
   --meter-serial 012345678901 \
-  --session ./012345678901.session \
-  --sdio 23 --sclk 18 --csb 27 --fcsb 26 --gpio3 14 \
+  --session ./meter.session \
   --alternative-channels
 ```
 
-```sh
-./build/nartisctl read \
-  --meter-serial 012345678901 \
-  --session ./012345678901.session \
-  --sdio 23 --sclk 18 --csb 27 --fcsb 26 --gpio3 14 \
-  --alternative-channels \
-  --obis 1.0.32.7.0.255,class=3,attr=2 \
-  --obis 1.0.1.7.0.255,class=3,attr=2
+Ожидаемый ответ:
+
+```
+{"paired":true}
 ```
 
-A CIU RF address is chosen automatically: a transplanted session supplies its own, and fresh pairing derives a stable per-host address. Pass `--ciu-address HEX16` only to force a specific address (for example to impersonate an existing CIU a meter is already paired with).
+Ключ и счётчики сеанса сохраняются в файл `./meter.session`. Все следующие чтения используют этот файл - повторно сопрягаться не нужно, даже после перезагрузки компьютера.
 
-### CC1101 radio
+> **Важно:** счётчик помнит только **одно** сопряжённое устройство. Новое сопряжение (с другого компьютера, ESP или дисплея Д101) вытесняет предыдущее - старому придётся сопрягаться заново.
 
-Pass `--radio cc1101` and a SPI device instead of the CMT2300A GPIO pins. The CC1101 uses the kernel SPI interface, so no bit-bang pins are needed.
+### 3. Чтение показаний
 
 ```sh
-# wiring sanity check
-./build/nartisctl chip-id --radio cc1101 --spi-dev /dev/spidev0.0
-
-# pair, then read
-./build/nartisctl pair \
+./build/nartisctl read \
   --radio cc1101 --spi-dev /dev/spidev0.0 \
+  --meter-serial 012345678901 \
+  --session ./meter.session \
+  --alternative-channels \
+  --obis 1.0.12.7.0.255 \
+  --obis 1.0.1.7.0.255 \
+  --obis 1.0.1.8.0.255 \
+  --obis 0.0.96.9.0.255
+```
+
+Ответ (одна строка, здесь разбита для удобства):
+
+```json
+{"values":[
+ {"obis":"1.0.12.7.0.255","class":3,"attr":2,"valid":true,"type":18,"number":2365,"text":"2365"},
+ {"obis":"1.0.1.7.0.255","class":3,"attr":2,"valid":true,"type":5,"number":364,"text":"364"},
+ {"obis":"1.0.1.8.0.255","class":3,"attr":2,"valid":true,"type":6,"number":18542556,"text":"18542556"},
+ {"obis":"0.0.96.9.0.255","class":3,"attr":2,"valid":true,"type":16,"number":99,"text":"99"}
+]}
+```
+
+Счётчик отдаёт **целые числа без масштаба** - множитель нужно применить самостоятельно:
+
+| OBIS | Что это | Пример | Множитель | Итог |
+|---|---|---|---|---|
+| `1.0.12.7.0.255` | Напряжение | 2365 | × 0.1 | 236.5 В |
+| `1.0.1.7.0.255` | Активная мощность | 364 | × 1 | 364 Вт |
+| `1.0.1.8.0.255` | Энергия (импорт, сумма) | 18542556 | × 0.001 | 18542.556 кВт·ч |
+| `0.0.96.9.0.255` | Температура | 99 | × 0.1 | 9.9 °C |
+
+Если у значения `"valid":false` - оно не прочитано.
+
+### Поправка частоты (`--freq-offset`)
+
+Кварц у каждого модуля CC1101 немного «уходит». Если счётчик не отвечает, или чтение иногда проходит, а сопряжение - нет, добавьте поправку частоты в герцах ко **всем** командам (`pair` и `read`):
+
+```sh
+./build/nartisctl pair --radio cc1101 --spi-dev /dev/spidev0.0 --freq-offset 14282 ...
+```
+
+Типичные значения - порядка +10000...+16000 Гц (тестовому модулю на Raspberry Pi 5 подошло `14282`). Как подобрать: в журнале (stderr) для каждого принятого кадра печатается `FREQEST`. При правильной поправке он близок к 0; одна единица FREQEST ≈ 1587 Гц.
+
+## Подключение CMT2300A
+
+Вместо `--radio cc1101 --spi-dev ...` укажите 5 GPIO. Номера - **BCM GPIO**, а не номера контактов на разъёме.
+
+```sh
+# проверка модуля
+./build/nartisctl chip-id --sdio 23 --sclk 18 --csb 27 --fcsb 26 --gpio3 14
+
+# сопряжение
+./build/nartisctl pair \
+  --sdio 23 --sclk 18 --csb 27 --fcsb 26 --gpio3 14 \
   --meter-serial 012345678901 --session ./meter.session --alternative-channels
 
+# чтение
 ./build/nartisctl read \
-  --radio cc1101 --spi-dev /dev/spidev0.0 \
+  --sdio 23 --sclk 18 --csb 27 --fcsb 26 --gpio3 14 \
   --meter-serial 012345678901 --session ./meter.session --alternative-channels \
-  --obis 1.0.32.7.0.255 --obis 1.0.1.7.0.255
+  --obis 1.0.1.7.0.255
 ```
 
-CC1101 options: `--spi-dev PATH` (default `/dev/spidev0.0`), `--gdo0 N` (optional GDO0 GPIO; polled over SPI if omitted), `--freq-offset HZ` (signed crystal correction applied to TX and RX), `--tx-preamble N` (default 12). Each CC1101 module's crystal is a few kHz off; if the meter never replies, read the FREQEST a sniffer reports on a received frame and pass it as `--freq-offset`. An offset that is a little off still lets short frames through but loses long ones, so pairing fails (the session-setup frame is long) while reads may still work. The Raspberry Pi 5 test module needed `--freq-offset 14282`; the debug log prints FREQEST for every received frame, which should be near 0 once the offset is right.
+## Регулярный опрос
 
-`--invoke-enforce` rejects a GET reply whose DLMS invoke-id, result count or length does not match the request and re-sends the same request. Without it the invoke-id is only logged (`GET invoke: sent=N recv=M match=yes|NO`). The tested meter echoes the invoke-id.
+**Опрашивайте не чаще раза в 2 минуты.** Сразу после предыдущего сеанса счётчик новый не открывает, и частый опрос даёт ошибки. Библиотека сама этот интервал не соблюдает - это задача вызывающего скрипта.
 
-See [docs/protocol-flow.md](docs/protocol-flow.md) for the pairing and read flows, timings and bench results.
+Пример - запись мощности в файл каждые 2 минуты:
 
-### Session transplant
+```sh
+#!/bin/sh
+while true; do
+  ./build/nartisctl read \
+    --radio cc1101 --spi-dev /dev/spidev0.0 \
+    --meter-serial 012345678901 --session ./meter.session --alternative-channels \
+    --obis 1.0.1.7.0.255 >> power.jsonl 2>> nartis.log
+  sleep 120
+done
+```
 
-Instead of pairing, a device can start already paired by loading a session copied from another already-paired device. Generate the session file with `nartis_session_gen` (it uses the library's own store format) and read with it; the CIU address is taken from the session, so no `--ciu-address` is needed. Only one device may use a given session at a time, and set `--frame-counter` above the source device's last TX counter to avoid replay rejection.
+Или через cron (одна строка в `crontab -e`):
+
+```
+*/2 * * * * cd /home/pi/nartis-rf433-v1-linux && ./build/nartisctl read --radio cc1101 --spi-dev /dev/spidev0.0 --meter-serial 012345678901 --session ./meter.session --alternative-channels --obis 1.0.1.7.0.255 >> power.jsonl 2>> nartis.log
+```
+
+Не запускайте два `nartisctl` с одним файлом сессии одновременно.
+
+Ещё примеры: [examples/read_active_power.py](examples/read_active_power.py) (Python), [examples/read_cc1101.sh](examples/read_cc1101.sh) (полный сценарий для CC1101).
+
+## Полезные OBIS-коды
+
+По умолчанию читается класс 3, атрибут 2 (значение регистра). Другие указываются так: `--obis 0.0.1.0.0.255,class=8,attr=2`.
+
+| OBIS | Что это | Множитель |
+|---|---|---|
+| `1.0.12.7.0.255` | Напряжение (однофазный счётчик) | 0.1 → В |
+| `1.0.32.7.0.255`, `1.0.52.7.0.255`, `1.0.72.7.0.255` | Напряжение фаз A, B, C | 0.1 → В |
+| `1.0.31.7.0.255`, `1.0.51.7.0.255`, `1.0.71.7.0.255` | Ток фаз A, B, C | 0.001 → А |
+| `1.0.1.7.0.255` | Активная мощность | 1 → Вт |
+| `1.0.1.8.0.255` | Энергия импорт, сумма | 0.001 → кВт·ч |
+| `1.0.1.8.1.255`, `1.0.1.8.2.255` | Энергия импорт, тариф 1, 2 | 0.001 → кВт·ч |
+| `1.0.14.7.0.255` | Частота сети | 0.01 → Гц |
+| `0.0.96.9.0.255` | Температура | 0.1 → °C |
+
+Полный список - в руководстве по эксплуатации дисплея Д101 и счётчиков И100 / И300, а также в README ESPHome-компонента.
+
+## Все параметры `nartisctl`
+
+Команды: `chip-id`, `scan`, `pair`, `read`.
+
+| Параметр | Назначение |
+|---|---|
+| `--meter-serial S` | Серийный номер счётчика (12 цифр). Нужен для всех команд, кроме `chip-id`. |
+| `--session PATH` | Файл сессии: создаётся при `pair`, используется при `read`. |
+| `--obis КОД[,class=N,attr=N]` | Что читать. Можно указывать несколько раз. |
+| `--alternative-channels` | Альтернативная сетка каналов - на ней отвечает большинство счётчиков. |
+| `--fixed-channel N` | Использовать только канал N вместо перебора. |
+| `--batch-size N` | Сколько OBIS читать одним запросом (по умолчанию 5). |
+| `--invoke-enforce` | Строгий режим: принимать только ответ на свой запрос, иначе повторить запрос. |
+| `--ciu-address HEX16` | Задать свой радиоадрес вручную (обычно не нужно - выбирается автоматически). |
+| `--radio cc1101` | Использовать CC1101 (по умолчанию CMT2300A). |
+| `--spi-dev PATH` | SPI-устройство CC1101 (по умолчанию `/dev/spidev0.0`). |
+| `--gdo0 N` | GPIO вывода GDO0 модуля CC1101 (необязательно). |
+| `--freq-offset HZ` | Поправка частоты CC1101 в Гц (может быть отрицательной). |
+| `--tx-preamble N` | Длина преамбулы CC1101 в байтах (по умолчанию 12). |
+| `--sdio --sclk --csb --fcsb --gpio3` | GPIO для CMT2300A (номера BCM). |
+
+Результат - в stdout (JSON), журнал работы - в stderr. Код возврата 0 - успех.
+
+## Если что-то не работает
+
+| Симптом | Что сделать |
+|---|---|
+| `CC1101 not detected` | Проверьте проводку, включён ли SPI, правильный ли `--spi-dev`. |
+| Счётчик не отвечает совсем | Проверьте серийный номер, `--alternative-channels`, расстояние до счётчика, `--freq-offset`. |
+| Чтение иногда работает, а сопряжение - нет | Почти наверняка нужна поправка `--freq-offset`. |
+| Работало, а потом перестало | Счётчик сопрягли с другим устройством (дисплей, ESP, другой компьютер). Выполните `pair` заново. |
+| Ошибки при частом опросе | Увеличьте интервал до 2 минут и больше. |
+| В журнале `Another display/reader (CIU ...) is talking to the meter` | Рядом работает дисплей Д101 или другой считыватель. Его кадры пропускаются, но счётчик может быть занят - повторите позже. |
+
+## Перенос сессии с другого устройства
+
+Вместо сопряжения можно загрузить готовую сессию уже сопряжённого устройства (например, ESP). Файл создаёт `nartis_session_gen`:
 
 ```sh
 ./build/nartis_session_gen \
-  --key   <32 hex: meter serial ASCII + 4 assigned bytes> \
-  --meter <16 hex meter RF address> \
-  --ciu   <16 hex CIU RF address> \
+  --key   <32 hex: ключ AES> \
+  --meter <16 hex: радиоадрес счётчика> \
+  --ciu   <16 hex: радиоадрес исходного устройства> \
   --frame-counter 1000 --out ./meter.session
-
-./build/nartisctl read --radio cc1101 --spi-dev /dev/spidev0.0 \
-  --meter-serial 012345678901 \
-  --session ./meter.session --alternative-channels --obis 1.0.1.7.0.255
 ```
 
-## Examples
+`--frame-counter` должен быть больше последнего счётчика кадров исходного устройства, иначе счётчик отбросит запросы. Сессией одновременно может пользоваться только одно устройство.
 
-- [examples/read_cc1101.sh](examples/read_cc1101.sh): full CC1101 CLI flow (chip-id, pair, read) with session-transplant notes.
-- [examples/read_active_power.py](examples/read_active_power.py): end-to-end Python example that sets GPIO pins, meter serial, and reads OBIS `1.0.1.7.0.255` Active Power through `nartisctl` (CMT2300A).
+## Для разработчиков
 
-## API
+Устройство библиотеки:
 
-Main public headers:
+- `radio` - общий интерфейс радиомодуля; `cmt2300a`, `cc1101` - драйверы.
+- `rf` - радиокадры Нартис, CRC-16/DNP, AES-128-GCM, счётчики кадров.
+- `dlms` - OBIS, запросы DLMS GET, разбор ответов.
+- `session` - сопряжение, хранение сессии, цикл чтения.
+- `platform` - GPIO, время, журнал (сейчас sysfs GPIO).
 
-- `include/nartis/nartis.h`: high-level meter API and `nartis_config_t`.
-- `include/nartis/nartis_radio.h`: radio vtable and `radio_type` selection.
-- `include/nartis/cmt2300a.h`, `include/nartis/cc1101.h`: low-level radio APIs.
-- `include/nartis/nartis_backend.h`: platform backend interface.
-- `include/nartis/nartis_types.h`: OBIS, value, config and error types.
+Заголовки: `include/nartis/nartis.h` (основной API и `nartis_config_t`), `nartis_radio.h`, `cc1101.h`, `cmt2300a.h`, `nartis_backend.h`, `nartis_types.h`.
 
-Typical flow:
+Порядок вызовов:
 
-1. Open a backend, for example `nartis_sysfs_backend_open`.
-2. Fill `nartis_config_t` (set `radio_type` and either `pins` for CMT2300A or `cc1101` for CC1101).
-3. Call `nartis_open`, `nartis_init`.
-4. Call `nartis_pair` once, or let `nartis_read` pair if no session exists.
-5. Call `nartis_read` with one or more `nartis_attr_t`.
+1. `nartis_sysfs_backend_open` - открыть платформу.
+2. Заполнить `nartis_config_t` (`radio_type`, `cc1101` или `pins`, `meter_serial`, `session_path`).
+3. `nartis_open`, `nartis_init`.
+4. `nartis_pair` - один раз (или `nartis_read` сам сопряжётся, если сессии нет).
+5. `nartis_read` с массивом `nartis_attr_t`.
+6. `nartis_close`.
 
-## Notes
-
-Leave a gap between reads. The meter will not open a fresh session immediately after the previous one; polling it again within a few tens of seconds tends to fail. Space `read` invocations by about 120 s (this is the caller's responsibility; the library does not enforce it). Within a single read the library now retries the wake, re-sends the get-request, and handles a mid-session re-key.
-
-The sysfs GPIO backend is dependency-light but timing-jittery. The backend interface is deliberately small so a faster Raspberry Pi backend can be added later using `libgpiod`, `pigpio`, or a kernel helper without touching the protocol layers.
+Описание протокола, таймингов и результатов на стенде: [docs/protocol-flow.md](docs/protocol-flow.md).
