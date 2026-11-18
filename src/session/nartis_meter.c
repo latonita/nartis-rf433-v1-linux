@@ -54,6 +54,7 @@ struct nartis_meter {
   char ciu_address_hex[24];
   char session_path[256];
   learned_type_t learned[MAX_LEARNED_TYPES];
+  unsigned foreign_ciu_frames;  /* frames from another CIU heard; first one is logged as a warning */
 };
 
 static bool dlms_type_is_var_len(uint8_t dtype) {
@@ -342,12 +343,35 @@ static int rx_parse(nartis_meter_t *m, uint8_t *payload, size_t payload_max,
                     uint8_t *type, uint32_t timeout_ms) {
   uint8_t frame[NARTIS_MAX_RF_FRAME_SIZE];
   size_t frame_len = 0;
-  int rc = rx_frame_raw(m, frame, &frame_len, timeout_ms);
-  if (rc != NARTIS_OK) return rc;
-  if (!m->rf.meter_address_set && frame_len >= 10) {
-    nartis_rf_set_meter_address(&m->rf, nartis_rf_address_from_bytes(frame + 2));
+  const uint64_t start = m->backend.millis(m->backend.ctx);
+  for (;;) {
+    uint64_t el = m->backend.millis(m->backend.ctx) - start;
+    if (el >= timeout_ms) return NARTIS_ERR_TIMEOUT;
+    int rc = rx_frame_raw(m, frame, &frame_len, (uint32_t)(timeout_ms - el));
+    if (rc != NARTIS_OK) return rc;
+    /* A frame another CIU (the meter's own display, a second reader) sent to
+     * the meter: same channels, same format. It is neither ours nor the meter's
+     * reply, so it must not count as a failed receive - drop it and keep
+     * listening within the same window (which still ends at timeout_ms). */
+    if (!nartis_rf_is_ciu_frame(&m->rf, frame, frame_len)) break;
+    m->foreign_ciu_frames++;
+    if (m->foreign_ciu_frames == 1) {
+      nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
+                         "another display/reader (CIU %02X%02X%02X%02X%02X%02X%02X%02X) is talking to the "
+                         "meter - ignoring its frames; the meter may be busy with it",
+                         frame[2], frame[3], frame[4], frame[5], frame[6], frame[7], frame[8], frame[9]);
+    }
+    nartis_backend_log(&m->backend, NARTIS_LOG_DEBUG, "ignored CIU frame type=0x%02X (%u so far) - still listening",
+                       frame[1], m->foreign_ciu_frames);
   }
+  /* Learn the meter address only from a presence ack (0x06) that carries the
+   * meter's device type and passes CRC. Taking it from whatever frame came
+   * first could learn the display's address, after which every real meter
+   * frame fails the address check. */
+  const bool learn = !m->rf.meter_address_set && frame_len >= 10 &&
+                     frame[1] == RX_TYPE_PRESENCE_ACK && frame[9] == NARTIS_RF_DEVICE_TYPE_METER;
   int prc = nartis_rf_parse_frame(&m->rf, frame, frame_len, payload, payload_max, type);
+  if (learn && prc >= 0) nartis_rf_set_meter_address(&m->rf, nartis_rf_address_from_bytes(frame + 2));
   /* Diagnostic: on a frame that fails to parse, dump it raw (L-field first) so a
    * bad CRC can be traced to where the stream broke. Good frames are not dumped:
    * a 0x53 carries the data key. */
@@ -525,16 +549,24 @@ int nartis_pair(nartis_meter_t *m) {
                          ack_try + 1, MAX_PAIR_ACK_RETRIES, plen);
       continue;
     }
-    got_reply = true;
     if (rx_type != RX_TYPE_SESSION_SETUP) {
+      got_reply = true;
       nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
                          "pair: meter answered 0x%02X instead of 0x53 - keeping current key", rx_type);
       break;
     }
-    /* Fresh key, fresh counters (as the ESPHome component does after 0x53). */
+    /* Fresh key, fresh counters (as the ESPHome component does after 0x53).
+     * Mode-6 makes the meter commit the key it just sent, so we must hold that
+     * key first: a 0x53 without a usable one re-sends the ACK and the meter
+     * repeats the 0x53, as the ESPHome component does. */
     got_key = install_setup_key_(m, payload, plen);
-    if (!got_key)
-      nartis_backend_log(&m->backend, NARTIS_LOG_WARN, "pair: 0x53 without a usable key - keeping current key");
+    if (got_key) {
+      got_reply = true;
+    } else {
+      nartis_backend_log(&m->backend, NARTIS_LOG_WARN,
+                         "pair: 0x53 without a usable key - re-sending ACK (try %d/%d)",
+                         ack_try + 1, MAX_PAIR_ACK_RETRIES);
+    }
   }
   if (!got_reply) return plen < 0 ? plen : NARTIS_ERR_PROTOCOL;
 

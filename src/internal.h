@@ -59,6 +59,12 @@ size_t nartis_rf_build_frame(nartis_rf_ctx_t *ctx, uint8_t *out, size_t out_max,
                              const uint8_t *payload, size_t payload_len);
 int nartis_rf_parse_frame(nartis_rf_ctx_t *ctx, const uint8_t *in, size_t in_len,
                           uint8_t *payload_out, size_t payload_max, uint8_t *type_out);
+/* True if `in` is a CRC-valid frame sent BY a CIU TO the meter (the meter's own
+ * display, or another reader): a CIU frame type at [1] (0x08/0x46/0x44/0x00,
+ * never used by the meter) and a sender device type at [9] other than the
+ * meter's 0x02. A radio never receives its own transmission, so such a frame is
+ * never ours and never the meter's reply. */
+bool nartis_rf_is_ciu_frame(nartis_rf_ctx_t *ctx, const uint8_t *in, size_t in_len);
 int nartis_rf_parse_nested(nartis_rf_ctx_t *ctx, const uint8_t *payload, size_t payload_len,
                            uint8_t *plain_out, size_t plain_max, bool mutate_counter);
 bool nartis_rf_extract_session_key(const nartis_rf_ctx_t *ctx, const uint8_t *payload,
